@@ -30,25 +30,38 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 
 | Endpoint            | Description                                                      |
 |---------------------|------------------------------------------------------------------|
-| `GET /health`       | `{name, version, connected, moq, torrent, port}`                  |
+| `GET /health`       | `{name, version, connected, moq, torrent, port}` (`torrent`: `live` when the engine booted) |
 | `GET /version`      | `{name, version}`                                                |
 | `GET /events`       | SSE: `hello` + 15s heartbeats.                                   |
 | `GET /capabilities` | `{name, version, capabilities}` (screen/audio/torrent flags)     |
-| `GET /audio/apps`   | `501 {error}` until native capture lands (future: `apps` SSE)    |
-| `POST /capture/start` | `501 {error}` until native capture lands (future: `{preview, session}`) |
-| `POST /capture/stop`  | `{stopped:true}` (idempotent, always 200)                        |
+| `GET /audio/apps`   | `{apps:[{id,name}]}` when listable, else `501 {error}`           |
+| `POST /audio/mode`  | `{mode}` persists `all`/`none`/`custom` (mute set preserved)     |
+| `POST /audio/mute`  | `{app, muted}` persists one app toggle                           |
+| `GET /capture/displays` | `[{id,name,width,height}]` from the OS                       |
+| `GET /capture/preview.jpg` | Latest frame JPEG, `404 {error:"idle"}` when stopped     |
+| `POST /capture/start` | `{started,display_id,width,height,fps}` (primary display; preview only — publish unwired, see below) |
+| `POST /capture/stop`  | `{stopped:true}` (idempotent, always 200)                      |
+| `POST /torrent/add` | `{id, name}` (waits ≤60s for magnet metadata; `504` on timeout)  |
+| `GET /torrent/list` | `{torrents:[{id,name,size,progress,state,downBps,files}]}`        |
+| `GET /torrent/data/{id}/{file}` | `206` ranged bytes (`Range`, index or path; `416` + `Content-Range: bytes */total` when unsatisfiable; single reads capped at 64 MiB) |
+| `POST /torrent/select` | `{selected:true}` (focuses the swarm on one file)             |
+| `GET /torrent/stats/{id}` | `{peers,downBps,downloaded,progress}`                       |
+| `DELETE /torrent/{id}` | `{removed:true}` (refuses metadata-less torrents: retry later) |
 
 Security: `Host` must be loopback (DNS-rebinding guard); CORS echoes
 allowlisted origins (`Access-Control-Allow-Origin` + Vary) on every endpoint
 including `GET /health`; `Access-Control-Allow-Private-Network: true`;
 `Cache-Control: no-store`. Browsers should `fetch` (not `EventSource`).
 
-Screen/audio capture is contract-only for now: `GET /capabilities` advertises
-`screen.available: false` / `audio.appList: false` / `torrent.available: false`,
-and `GET /audio/apps` + `POST /capture/start` answer `501 {error:
-"not_implemented"}` until the native capture phase lands. The web UI probes
-`/capabilities` and meanwhile falls back to the browser picker
-(`getDisplayMedia`), so nothing breaks while the contract is stubbed.
+Torrent bytes download into the OS temp dir (`jlocal-torrents`); session
+state persists there for fastresume. No UPnP: the app never punches NAT holes.
+Reads ahead of the download block on the swarm (no prefetch beyond the
+engine's lookahead) and fail after 90s per read (`504`).
+
+Screen publish is still unwired: the relay speaks MoQ draft-16 and no Rust
+crate negotiates it (draft-18+/moq-lite only), so `screen.available` stays
+`false` and the web UI keeps routing to the browser picker. Capture
+endpoints above are live (real frames), ready for a transport when one exists.
 
 Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
 (comma-separated `https://` origins, replaces the juntos.lol + beta defaults),

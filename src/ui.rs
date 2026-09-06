@@ -5,7 +5,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-use crate::status::AppState;
+use jlocal::status::AppState;
 
 struct App {
     title: String,
@@ -42,7 +42,7 @@ pub fn run(rt: tokio::runtime::Runtime, state: AppState, port: u16) {
     let _ = &state;
     let title = format!(
         "jlocal {} — connected (127.0.0.1:{port})",
-        crate::status::VERSION
+        jlocal::status::VERSION
     );
     let event_loop = match EventLoop::new() {
         Ok(el) => el,

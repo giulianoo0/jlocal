@@ -1,9 +1,8 @@
 //! jlocal — loopback API + tiny status/version window.
 
-mod api;
-mod status;
-mod ui;
+use jlocal::{api, status};
 
+mod ui;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use clap::Parser;
@@ -30,12 +29,25 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let state = status::AppState::new();
+    let mut state = status::AppState::new();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // Boot the local torrent engine before serving: on success the
+    // capabilities flag flips and /torrent/* serves ranged bytes. On
+    // failure the app still runs (health/CORS/capture work) and the
+    // torrent routes honestly answer 503.
+    match rt.block_on(jlocal::torrent::TorrentManager::new(
+        jlocal::torrent::default_dir(),
+    )) {
+        Ok(manager) => {
+            state.caps.torrent = true;
+            state.torrent = Some(manager);
+        }
+        Err(e) => eprintln!("jlocal: torrent engine unavailable ({e:#}); /torrent/* answers 503"),
+    }
 
     // Bind BEFORE opening any window so "already running" is a clear error,
     // never a silent port-hop (the web UI probes one fixed port).
