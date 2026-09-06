@@ -248,7 +248,8 @@ fn snapshot_jpeg(img: image::RgbaImage, target_width: u32) -> anyhow::Result<Vec
     let rgba = if (out_w, out_h) == (src_w, src_h) {
         img.into_raw()
     } else {
-        image::imageops::resize(&img, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
+        image::imageops::resize(&img, out_w, out_h, image::imageops::FilterType::Triangle)
+            .into_raw()
     };
     encode_jpeg_rgba(&rgba, out_w, out_h, DEFAULT_JPEG_QUALITY)
 }

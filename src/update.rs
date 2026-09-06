@@ -368,9 +368,7 @@ mod tests {
 
     /// One-shot stub origin: serves a single canned response, then drops.
     async fn stub_origin(response: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/releases/latest", listener.local_addr().unwrap());
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {

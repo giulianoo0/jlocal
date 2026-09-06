@@ -311,10 +311,7 @@ async fn capture_snapshot(
         Display(Option<u32>),
         Window(u32),
     }
-    let target: Result<Target, String> = match (
-        params.get("display_id"),
-        params.get("window_id"),
-    ) {
+    let target: Result<Target, String> = match (params.get("display_id"), params.get("window_id")) {
         (Some(_), Some(_)) => Err("only one of display_id, window_id".to_string()),
         (None, None) => Err("display_id or window_id required".to_string()),
         (Some(raw), None) => {
@@ -362,16 +359,16 @@ async fn capture_snapshot(
             Target::Display(requested) => {
                 let displays =
                     crate::capture::list_displays().map_err(|_| snapshot_unavailable())?;
-                let display = select_display(&displays, requested).ok_or_else(|| match requested {
-                    Some(id) => (StatusCode::BAD_REQUEST, format!("display {id} not found")),
-                    None => snapshot_unavailable(),
-                })?;
+                let display =
+                    select_display(&displays, requested).ok_or_else(|| match requested {
+                        Some(id) => (StatusCode::BAD_REQUEST, format!("display {id} not found")),
+                        None => snapshot_unavailable(),
+                    })?;
                 crate::capture::snapshot_display(display.id, width)
                     .map_err(|_| snapshot_unavailable())
             }
             Target::Window(id) => {
-                let windows =
-                    crate::capture::list_windows().map_err(|_| snapshot_unavailable())?;
+                let windows = crate::capture::list_windows().map_err(|_| snapshot_unavailable())?;
                 let window = select_window(&windows, id)
                     .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("window {id} not found")))?;
                 crate::capture::snapshot_window(window.id, width)
@@ -381,9 +378,7 @@ async fn capture_snapshot(
     })();
     let mut res = match snapshot {
         Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
-        Err((status, error)) => {
-            (status, Json(serde_json::json!({"error": error}))).into_response()
-        }
+        Err((status, error)) => (status, Json(serde_json::json!({"error": error}))).into_response(),
     };
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
