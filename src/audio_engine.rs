@@ -802,7 +802,6 @@ mod macos {
 mod windows {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
-    use windows_core::{implement, Ref, GUID, HRESULT};
     use windows::Win32::Media::Audio::{
         ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
         IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -814,6 +813,7 @@ mod windows {
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
     use windows::Win32::UI::Shell::PropertiesSystem::InitPropVariantFromBuffer;
+    use windows_core::{implement, Ref, GUID, HRESULT};
 
     /// Audible-process candidates: GUI processes from the process table with
     /// their pids, minus the exclusion set. Names reuse the

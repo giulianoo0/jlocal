@@ -256,7 +256,6 @@ fn window_icon_for_pid(pid: u32) -> Option<String> {
 /// block per Win32 step, `?`/`None` on any failure, GDI objects released.
 #[cfg(target_os = "windows")]
 fn window_icon_for_pid(pid: u32) -> Option<String> {
-    use windows_core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -264,6 +263,7 @@ fn window_icon_for_pid(pid: u32) -> Option<String> {
     };
     use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
     use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+    use windows_core::{PCWSTR, PWSTR};
 
     // pid → exe path (nul-terminated for the shell call below).
     let path = unsafe {
