@@ -1,0 +1,111 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system deps (winit)
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        env:
+          JLOCAL_VERSION: ${{ github.ref_name }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/jlocal"
+          STAGE="dist/jlocal-${TAG}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "$BIN" "$STAGE/jlocal"
+          cp README.md "$STAGE/" || true
+          tar -czf "dist/jlocal-${TAG}-${{ matrix.target }}.tar.gz" -C dist "jlocal-${TAG}-${{ matrix.target }}"
+
+      - name: DMG (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          STAGE="dist/jlocal-${TAG}-${{ matrix.target }}"
+          hdiutil create -volname "jlocal ${TAG}" -srcfolder "$STAGE" -ov -format UDZO \
+            "dist/jlocal-${TAG}-${{ matrix.target }}.dmg"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $stage = "dist/jlocal-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/jlocal.exe" "$stage/jlocal.exe"
+          if (Test-Path README.md) { Copy-Item README.md $stage }
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/jlocal-$env:TAG-${{ matrix.target }}.zip" -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jlocal-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > sha256sums.txt || shasum -a 256 -- * > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --title "jlocal $TAG" \
+            --notes "jlocal $TAG — local companion skeleton: loopback API (/health, /version, /events) + status/version window. See README for install steps per OS." \
+            dist/*
