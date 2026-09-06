@@ -1291,12 +1291,14 @@ mod tests {
             Window {
                 id: 3,
                 name: "a".into(),
+                app: "A".into(),
                 width: 800,
                 height: 600,
             },
             Window {
                 id: 5,
                 name: "b".into(),
+                app: "B".into(),
                 width: 1024,
                 height: 768,
             },

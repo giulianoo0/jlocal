@@ -61,11 +61,13 @@ pub struct Display {
     pub height: u32,
 }
 
-/// One app window, as reported by the OS.
+/// One app window, as reported by the OS. `app` is the owning application
+/// (empty when the OS would not say); `name` stays the human label.
 #[derive(Clone, Debug, Serialize)]
 pub struct Window {
     pub id: u32,
     pub name: String,
+    pub app: String,
     pub width: u32,
     pub height: u32,
 }
@@ -166,12 +168,15 @@ pub fn list_windows() -> anyhow::Result<Vec<Window>> {
             continue;
         }
         // Prefer the window title; fall back to the app name, then to a
-        // synthetic label so callers always have something to show.
+        // synthetic label so callers always have something to show. The raw
+        // app name always rides along for icons/avatars.
         let title = w.title().unwrap_or_default();
+        let app = w.app_name().unwrap_or_default().trim().to_string();
         let name = if title.trim().is_empty() {
-            match w.app_name() {
-                Ok(app) if !app.trim().is_empty() => app,
-                _ => format!("Window {id}"),
+            if app.is_empty() {
+                format!("Window {id}")
+            } else {
+                app.clone()
             }
         } else {
             title
@@ -179,6 +184,7 @@ pub fn list_windows() -> anyhow::Result<Vec<Window>> {
         out.push(Window {
             id,
             name,
+            app,
             width,
             height,
         });
