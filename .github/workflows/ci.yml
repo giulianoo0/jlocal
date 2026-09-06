@@ -16,11 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Linux system deps (winit)
+      - name: Linux system deps (winit + xcap PipeWire)
         if: runner.os == 'Linux'
         run: >
           sudo apt-get update &&
-          sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev libpipewire-0.3-dev
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
