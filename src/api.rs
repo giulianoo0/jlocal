@@ -343,6 +343,19 @@ async fn capture_snapshot(
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(crate::capture::SNAPSHOT_DEFAULT_WIDTH),
     );
+    // The OS prompt must fire from an explicit confirm, never from the
+    // picker's 1s preview poll: when the probe says blocked, fail fast with
+    // 503 without touching the capture API (which is what re-opens the
+    // system prompt on every poll).
+    if !crate::permissions::screen_capture_granted() {
+        let mut denied = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "permission"})),
+        )
+            .into_response();
+        apply_cors(&s.state, &headers, denied.headers_mut());
+        return with_no_store(denied);
+    }
     let snapshot: Result<Vec<u8>, (StatusCode, String)> = (|| {
         let target = target.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         match target {
