@@ -4,6 +4,7 @@
 //! (`audio`, `capture`, `publish` types and constants) is genuinely exported
 pub mod api;
 pub mod audio;
+pub mod audio_engine;
 pub mod capture;
 pub mod permissions;
 pub mod publish;

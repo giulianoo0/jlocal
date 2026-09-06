@@ -34,11 +34,11 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `GET /health`       | `{name, version, connected, moq, torrent, port}` (`torrent`: `live` when the engine booted) |
 | `GET /version`      | `{name, version}`                                                |
 | `GET /events`       | SSE: `hello` + 15s heartbeats.                                   |
-| `GET /capabilities` | `{name, version, capabilities}` (`screen.capture`: frame capture live; `screen.available`: relay publish, still `false`; audio/torrent flags; `permissions.screenCapture`: OS capture consent, live probe) |
+| `GET /capabilities` | `{name, version, capabilities}` (`screen.capture`: frame capture live; `screen.available`: relay publish, still `false`; `audio.capture`: per-app system-audio tap wired (macOS/Windows) vs `false` (Linux stub); audio/torrent flags; `permissions.screenCapture`: OS capture consent, live probe) |
 | `GET /audio/apps`   | `{apps:[{id,name}]}` when listable, else `501 {error}`           |
-| `POST /audio/mode`  | `{mode}` persists `all`/`none`/`custom` (mute set preserved)     |
-| `POST /audio/mute`  | `{app, muted}` persists one app toggle                           |
-| `GET /capture/displays` | `{displays:[{id,name,width,height}]}` from the OS           |
+| `POST /audio/mode`  | `{mode}` persists `all`/`none`/`custom` (mute set preserved, takes effect live) |
+| `POST /audio/mute`  | `{app, muted}` persists one app toggle (takes effect live)       |
+| `GET /audio/stream` | System-audio mix while a capture session is live: infinite raw `s16le` 48 kHz stereo PCM (`Content-Type: audio/L16`), one 3840-byte chunk per ~20 ms tick, chunked + `no-store` + CORS; `404 {error:"idle"}` when stopped (the body also ends on `/capture/stop`); `501 {error}` on Linux. Mute semantics: `all` = full mix, `none` = silence (stream stays open), `custom` = mix minus muted apps (`app` ids match `/capture/windows`). macOS taps via ScreenCaptureKit (single system mix + `excludingApplications` filter for mutes; needs Screen Recording); Windows via per-process WASAPI loopback taps (one client per audible process, muted processes dropped). Underflow or a refused tap degrades to silence, never a hang. |
 | `GET /capture/windows` | `{windows:[{id,name,app,icon,width,height}]}` from the OS (minimized/zero-area skipped; `icon` is the owning app's icon as a `data:image/png;base64,…` URL at 32px, `""` when unavailable — macOS + Windows only, Linux always `""`) |
 | `GET /capture/preview.jpg` | Latest frame JPEG, `404 {error:"idle"}` when stopped     |
 | `GET /capture/snapshot` | One-frame JPEG for picker previews: `?display_id=<id\|empty=primary>` xor `?window_id=<id>`, `&width=<px>` (default 960, clamp 160–1920, aspect kept); `200 image/jpeg`; `400` both/neither/garbage/unknown id; `503 {error:"permission"\|"unavailable"}` (stateless — never touches the running session) |

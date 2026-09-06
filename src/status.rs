@@ -44,6 +44,10 @@ pub struct CapabilityFlags {
     pub screen_capture: bool,
     /// The app list is truly listable on this machine.
     pub app_list: bool,
+    /// Per-app system-audio capture is wired: `GET /audio/stream` serves
+    /// the mixed PCM stream on macOS/Windows, `501` on Linux. See
+    /// [`crate::audio_engine::capture_supported`].
+    pub audio_capture: bool,
     /// Local torrenting serves ranged bytes.
     pub torrent: bool,
 }
@@ -54,6 +58,7 @@ impl Default for CapabilityFlags {
             screen: false,
             screen_capture: true,
             app_list: false,
+            audio_capture: crate::audio_engine::capture_supported(),
             torrent: false,
         }
     }
@@ -66,6 +71,10 @@ pub struct AppState {
     pub caps: CapabilityFlags,
     pub capture: std::sync::Arc<parking_lot::Mutex<Option<crate::capture::CaptureSession>>>,
     pub audio: std::sync::Arc<parking_lot::Mutex<crate::audio::AudioState>>,
+    /// Shared system-audio tap feeding `GET /audio/stream`. Started lazily
+    /// by the first stream request while a capture session is live, stopped
+    /// by `/capture/stop` alongside the video session.
+    pub audio_tap: std::sync::Arc<parking_lot::Mutex<crate::audio_engine::AudioTap>>,
     /// Local torrent engine. `None` until the async session boots at
     /// startup; handlers answer 503 while it is absent.
     pub torrent: Option<crate::torrent::TorrentManager>,
@@ -96,6 +105,9 @@ impl AppState {
             caps,
             capture: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             audio: std::sync::Arc::new(parking_lot::Mutex::new(crate::audio::AudioState::new())),
+            audio_tap: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::audio_engine::AudioTap::new(),
+            )),
             torrent: None,
             update: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::update::UpdateState::default(),

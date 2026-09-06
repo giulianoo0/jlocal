@@ -5,6 +5,10 @@
 //! - `GET /events`  -> SSE: `hello` then 15s heartbeat comments.
 //! - `GET /capabilities`   -> { name, version, capabilities }
 //! - `GET /audio/apps`     -> { apps } when listable, else 501 { error }
+//! - `POST /audio/mode`    -> { mode } persists all/none/custom (live)
+//! - `POST /audio/mute`    -> { app, muted } persists one toggle (live)
+//! - `GET /audio/stream`   -> infinite s16le 48kHz stereo PCM while a capture
+//!   session is live (`404 {error:"idle"}` when stopped, `501` where unwired)
 //! - `POST /capture/start` -> { started, display_id|window_id, width, height, fps }
 //! - `POST /capture/stop`  -> { stopped: true }
 //! - `GET /capture/snapshot` -> one-frame JPEG (`?display_id=<id|empty=primary>` xor `?window_id=<id>`, `&width=<px>`)
@@ -73,6 +77,7 @@ struct ScreenCapabilities {
 struct AudioCapabilities {
     #[serde(rename = "appList")]
     app_list: bool,
+    capture: bool,
 }
 
 #[derive(Serialize)]
@@ -94,6 +99,7 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/audio/apps", get(audio_apps))
         .route("/audio/mode", post(audio_mode))
         .route("/audio/mute", post(audio_mute))
+        .route("/audio/stream", get(audio_stream))
         .route("/capture/displays", get(capture_displays))
         .route("/capture/windows", get(capture_windows))
         .route("/capture/preview.jpg", get(capture_preview))
@@ -112,6 +118,8 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/capabilities", axum::routing::options(preflight))
         .route("/audio/apps", axum::routing::options(preflight))
         .route("/audio/mode", axum::routing::options(preflight))
+        .route("/audio/mute", axum::routing::options(preflight))
+        .route("/audio/stream", axum::routing::options(preflight))
         .route("/capture/displays", axum::routing::options(preflight))
         .route("/capture/windows", axum::routing::options(preflight))
         .route("/capture/preview.jpg", axum::routing::options(preflight))
@@ -214,6 +222,7 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
             },
             audio: AudioCapabilities {
                 app_list: s.state.caps.app_list,
+                capture: s.state.caps.audio_capture,
             },
             torrent: TorrentCapabilities {
                 available: s.state.caps.torrent,
@@ -571,6 +580,9 @@ async fn capture_start(
 
 async fn capture_stop(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     *s.state.capture.lock() = None;
+    // The audio mix belongs to the session: ending it here closes any live
+    // `/audio/stream` body on its next tick (clean EOF, not a hang).
+    s.state.audio_tap.lock().stop();
     let mut res = Json(serde_json::json!({"stopped": true})).into_response();
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
@@ -942,6 +954,11 @@ async fn audio_mode(
     let mut res = match mode {
         Ok(mode) => {
             s.state.audio.lock().set_mode(mode);
+            // Live: the running tap re-filters (macOS rebuilds the SCK
+            // exclusion set, Windows restarts its per-process taps) and the
+            // next stream tick mixes with the new mode anyway.
+            let muted = s.state.audio.lock().muted_apps.clone();
+            s.state.audio_tap.lock().set_excluded(&muted);
             Json(serde_json::json!({"mode": mode})).into_response()
         }
         Err(error) => (
@@ -983,6 +1000,10 @@ async fn audio_mute(
             } else {
                 audio.muted_apps.remove(&app);
             }
+            drop(audio);
+            // Live: same re-filter as a mode switch (see `audio_mode`).
+            let muted_set = s.state.audio.lock().muted_apps.clone();
+            s.state.audio_tap.lock().set_excluded(&muted_set);
             Json(serde_json::json!({"app": app, "muted": muted})).into_response()
         }
         Err(error) => (
@@ -991,6 +1012,70 @@ async fn audio_mute(
         )
             .into_response(),
     };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+/// System-audio mix as an infinite raw PCM body: `s16le`, 48 kHz, stereo,
+/// one [`crate::audio_engine::BYTES_PER_CHUNK`]-byte chunk per ~20 ms tick
+/// (`Content-Type: audio/L16`). No framing headers, no container.
+///
+/// - `501 {error}` where unwired (Linux).
+/// - `404 {error:"idle"}` with no capture session: the mix belongs to the
+///   CURRENT session (starts/stops with it — the body ends when
+///   `/capture/stop` lands).
+/// - Otherwise `200`: every tick drains the platform tap, mixes it with
+///   the LIVE [`crate::audio::AudioState`] (`all` = full mix, `none` =
+///   silence, `custom` = mix minus the muted set), and pads underflow with
+///   silence, so the browser `AudioContext` graph never starves — even when
+///   the tap itself is still starting or the OS refused it.
+async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    if !crate::audio_engine::capture_supported() {
+        let mut res = (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "not_implemented"})),
+        )
+            .into_response();
+        apply_cors(&s.state, &headers, res.headers_mut());
+        return with_no_store(res);
+    }
+    if s.state.capture.lock().is_none() {
+        let mut res = (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "idle"})),
+        )
+            .into_response();
+        apply_cors(&s.state, &headers, res.headers_mut());
+        return with_no_store(res);
+    }
+    // Lazy tap start, off the async runtime (the OS handshake blocks). A
+    // refusal still streams: the ticks below degrade to silence.
+    let tap = s.state.audio_tap.clone();
+    let muted = s.state.audio.lock().muted_apps.clone();
+    let _ = tokio::task::spawn_blocking(move || tap.lock().start(&muted)).await;
+    let state = s.state.clone();
+    let stream = async_stream::stream! {
+        let mut pending: Vec<i16> = Vec::new();
+        loop {
+            // Session stopped mid-stream: end the body (clean EOF).
+            if state.capture.lock().is_none() {
+                break;
+            }
+            let audio = state.audio.lock().clone();
+            let mixed =
+                crate::audio_engine::mix_frames(&state.audio_tap.lock().drain_frames(), &audio);
+            let bytes = crate::audio_engine::push_tick(&mut pending, mixed);
+            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::copy_from_slice(
+                &bytes,
+            ));
+            tokio::time::sleep(crate::audio_engine::FRAME_INTERVAL).await;
+        }
+    };
+    let mut res = axum::body::Body::from_stream(stream).into_response();
+    res.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(crate::audio_engine::CONTENT_TYPE),
+    );
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
@@ -1094,6 +1179,9 @@ mod tests {
                 audio: std::sync::Arc::new(
                     parking_lot::Mutex::new(crate::audio::AudioState::new()),
                 ),
+                audio_tap: std::sync::Arc::new(parking_lot::Mutex::new(
+                    crate::audio_engine::AudioTap::new(),
+                )),
                 torrent: None,
                 update: std::sync::Arc::new(parking_lot::Mutex::new(
                     crate::update::UpdateState::default(),
@@ -1185,7 +1273,11 @@ mod tests {
         assert_eq!(v["capabilities"]["screen"]["maxHeight"], 2160);
         assert_eq!(v["capabilities"]["screen"]["maxFps"], 60);
         assert_eq!(v["capabilities"]["audio"]["appList"], false);
-        assert_eq!(v["capabilities"]["torrent"]["available"], false);
+        // Wired on macOS/Windows (the PCM tap compiles in), stubbed Linux.
+        assert_eq!(
+            v["capabilities"]["audio"]["capture"],
+            crate::audio_engine::capture_supported()
+        );
     }
 
     #[tokio::test]
@@ -1531,6 +1623,82 @@ mod tests {
         .into_response();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(!state.state.audio.lock().muted_apps.contains("discord"));
+    }
+
+    #[tokio::test]
+    async fn audio_stream_idle_is_404() {
+        // No capture session: the mix has no owner, so 404 + idle — same
+        // envelope as the preview endpoint, CORS + no-store intact.
+        let res = audio_stream(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"error": "idle"}));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn audio_stream_unwired_is_501() {
+        // Linux has no tap: even with a session the route stays 501.
+        let state = state_with(&["https://beta.juntos.lol"]);
+        *state.state.capture.lock() = Some(crate::capture::CaptureSession::new());
+        let res = audio_stream(State(state), origin_headers("https://beta.juntos.lol"))
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("error").is_some(), "{v}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[tokio::test]
+    async fn audio_stream_serves_pcm_while_live() {
+        // A live session upgrades the route to 200 + the L16 content type.
+        // The body is dropped unread: the tap keeps capturing against a
+        // machine that may refuse it (no Screen Recording grant), which
+        // degrades to silence — the headers are the contract under test.
+        let state = state_with(&["https://beta.juntos.lol"]);
+        *state.state.capture.lock() = Some(crate::capture::CaptureSession::new());
+        let res = audio_stream(State(state), origin_headers("https://beta.juntos.lol"))
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::audio_engine::CONTENT_TYPE)
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
+        );
     }
 
     #[test]
