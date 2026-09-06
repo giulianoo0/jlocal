@@ -13,7 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Where we look for a newer release.
-pub const RELEASES_URL: &str = "https://api.github.com/giulianoo0/jlocal/releases/latest";
+///
+/// `…/releases/latest` answers 302 to the newest `…/releases/tag/vX.Y.Z`.
+/// We read the tag off that redirect's `location` without following it, so
+/// the check never touches the GitHub REST API (which 404s anonymously
+/// here even though the repo is public).
+pub const RELEASES_URL: &str = "https://github.com/giulianoo0/jlocal/releases/latest";
 
 /// Boot + this often. Six hours: fresh enough to matter, quiet enough to
 /// never look like phoning home.
@@ -89,8 +94,21 @@ pub fn asset_url(tag: &str) -> Option<String> {
         .map(|name| format!("https://github.com/giulianoo0/jlocal/releases/download/{tag}/{name}"))
 }
 
-/// Short-timeout client for update traffic only.
+/// Short-timeout client for the version check only. Redirects are disabled:
+/// [`latest_tag`] reads the tag off the `…/releases/latest` 302 itself, so
+/// following it would download a web page instead of a tag.
 pub fn client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("jlocal/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(anyhow::Error::from)
+}
+
+/// Short-timeout client for asset downloads, which redirect (releases to a
+/// CDN) and so need the default redirect-following policy.
+pub fn download_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(concat!("jlocal/", env!("CARGO_PKG_VERSION")))
@@ -99,20 +117,37 @@ pub fn client() -> anyhow::Result<reqwest::Client> {
 }
 
 /// Newest release tag (`v…`), or an error the caller records and moves on.
+///
+/// `GET`s [`RELEASES_URL`] without following redirects and reads the tag off
+/// the 302's `location` (`…/releases/tag/vX.Y.Z`). Anything else — a non-302
+/// status, a missing or odd `location`, a network error — is a best-effort
+/// miss, exactly like a failed API check used to be.
 pub async fn latest_tag(client: &reqwest::Client) -> anyhow::Result<String> {
-    let release: serde_json::Value = client
-        .get(RELEASES_URL)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    release
-        .get("tag_name")
-        .and_then(|t| t.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("release has no tag_name"))
+    latest_tag_from(client, RELEASES_URL).await
+}
+
+/// [`latest_tag`] against an arbitrary URL, so tests can point it at a local
+/// stub instead of the live releases page.
+async fn latest_tag_from(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
+    let response = client.get(url).send().await?;
+    if response.status() != reqwest::StatusCode::FOUND {
+        anyhow::bail!("expected 302, got {}", response.status());
+    }
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .ok_or_else(|| anyhow::anyhow!("redirect has no location header"))?
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("redirect location is not readable"))?;
+    let tag = location
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("redirect location has no tag: {location}"))?;
+    if parse_version(tag).is_none() {
+        anyhow::bail!("redirect location has no parseable tag: {location}");
+    }
+    Ok(tag.to_string())
 }
 
 /// Download + extract the executable for `tag`. Returns raw bytes, ready to
@@ -327,6 +362,57 @@ mod tests {
             assert!(
                 !update_available(bad, "v9.9.9"),
                 "current {bad} must not trigger"
+            );
+        }
+    }
+
+    /// One-shot stub origin: serves a single canned response, then drops.
+    async fn stub_origin(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}/releases/latest", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn redirect_tag_is_parsed() {
+        let url = stub_origin(
+            "HTTP/1.1 302 Found\r\nlocation: /giulianoo0/jlocal/releases/tag/v9.9.9\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        let tag = latest_tag_from(&client().unwrap(), &url).await.unwrap();
+        assert_eq!(tag, "v9.9.9");
+    }
+
+    #[tokio::test]
+    async fn non_redirect_is_a_miss() {
+        let url = stub_origin(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
+        )
+        .await;
+        assert!(latest_tag_from(&client().unwrap(), &url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn garbage_location_is_a_miss() {
+        for response in [
+            "HTTP/1.1 302 Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nlocation: /giulianoo0/jlocal/releases\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nlocation: /giulianoo0/jlocal/releases/tag/latest\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        ] {
+            let url = stub_origin(response).await;
+            assert!(
+                latest_tag_from(&client().unwrap(), &url).await.is_err(),
+                "{response} must miss"
             );
         }
     }

@@ -124,7 +124,7 @@ impl App {
         self.rt.spawn(async move {
             let tag = state.update.lock().latest_tag.clone();
             let Some(tag) = tag else { return };
-            let fetched = match jlocal::update::client() {
+            let fetched = match jlocal::update::download_client() {
                 Ok(client) => jlocal::update::fetch_binary(&client, &tag).await,
                 Err(e) => Err(e),
             };

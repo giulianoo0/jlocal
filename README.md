@@ -73,9 +73,10 @@ Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
 
 ## Self-update
 
-On boot and every 6h the app checks
-`https://api.github.com/giulianoo0/jlocal/releases/latest` (10s timeout,
-best-effort, never blocks boot). When the tag is newer than its own build
+On boot and every 6h the app `GET`s
+`https://github.com/giulianoo0/jlocal/releases/latest` without following
+redirects (10s timeout, best-effort, never blocks boot) and reads the newest
+tag off the 302's `location` (`…/releases/tag/vX.Y.Z`). When the tag is newer than its own build
 it shows `update available vX` in the window title and enables the tray's
 `Install update vX` item (plus a manual `Check for updates now` item).
 Install downloads the release asset for the OS (`jlocal-<tag>-<target>.tar.gz`
