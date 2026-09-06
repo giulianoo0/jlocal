@@ -383,7 +383,6 @@ async fn capture_snapshot(
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
-
 /// 503 for a failed snapshot: `permission` when the OS probe says capture is
 /// blocked (the user must grant Screen Recording), else `unavailable`.
 fn snapshot_unavailable() -> (StatusCode, String) {
@@ -393,6 +392,21 @@ fn snapshot_unavailable() -> (StatusCode, String) {
         "permission"
     };
     (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+}
+
+/// Status for a failed `CaptureSession::start`: validation failures stay 400,
+/// but a failed eager first grab (see `launch`) is a 503 — the session can
+/// never yield frames. When the OS probe says blocked the body is
+/// `permission` (the web shows its Screen Recording hint); otherwise the
+/// grab's own message rides along so the real reason is visible.
+fn start_capture_status(error: anyhow::Error) -> (StatusCode, String) {
+    if !error.to_string().starts_with("capture failed") {
+        return (StatusCode::BAD_REQUEST, error.to_string());
+    }
+    if crate::permissions::screen_capture_granted() {
+        return (StatusCode::SERVICE_UNAVAILABLE, error.to_string());
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, "permission".to_string())
 }
 
 fn capture_size(body: &serde_json::Value) -> (u32, u32, u32) {
@@ -521,7 +535,7 @@ async fn capture_start(
                 let mut session = crate::capture::CaptureSession::new();
                 session
                     .start(display.id, width, height, fps)
-                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                    .map_err(start_capture_status)?;
                 let live_id = session.display_id();
                 let (got_w, got_h, got_fps) = (width, height, session.fps());
                 s.state.capture.lock().replace(session);
@@ -537,7 +551,7 @@ async fn capture_start(
                 let mut session = crate::capture::CaptureSession::new();
                 session
                     .start_window(window.id, width, height, fps)
-                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                    .map_err(start_capture_status)?;
                 let live_id = session.window_id();
                 let (got_w, got_h, got_fps) = (width, height, session.fps());
                 s.state.capture.lock().replace(session);
@@ -1347,6 +1361,24 @@ mod tests {
             assert!(
                 icon.is_empty() || icon.starts_with("data:image/png;base64,"),
                 "unexpected icon shape"
+            );
+        }
+    }
+    #[test]
+    fn start_validation_failures_stay_400() {
+        // Only the eager first grab (a "capture failed …" message) maps to
+        // 503; every validation message stays 400 on every machine.
+        for message in [
+            "display 9 not found",
+            "requested 3840x2160 exceeds display 1 size 1512x982",
+            "invalid display_id",
+            "display_id or window_id required",
+        ] {
+            let (status, _) = super::start_capture_status(anyhow::anyhow!(message));
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "wrong status for {message}"
             );
         }
     }

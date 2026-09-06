@@ -631,10 +631,22 @@ impl CaptureSession {
         let fps = clamp_fps(fps);
         self.shutdown();
 
+        // Eager first grab, synchronously: a start that cannot capture (no
+        // permission, target gone) fails HERE instead of reporting success
+        // and publishing black frames forever. This is also the single place
+        // that may trigger the OS permission prompt — i.e. only on explicit
+        // user intent (confirm), never on a preview/snapshot poll.
+        let source = resolve_source(target)?;
+        let (rgba, width, height) = grab_sized(&source, target, width, height)?;
+
         self.stop_flag.store(false, Ordering::SeqCst);
         *lock(&self.last_error) = None;
         *lock(&self.ema_interval_secs) = 0.0;
-        *lock(&self.frame) = SharedFrame::empty();
+        *lock(&self.frame) = SharedFrame {
+            rgba,
+            width,
+            height,
+        };
 
         let stop_flag = Arc::clone(&self.stop_flag);
         let frame = Arc::clone(&self.frame);
@@ -756,6 +768,65 @@ enum CaptureTarget {
     Window(u32),
 }
 
+/// A resolved grab source: the xcap handle behind a [`CaptureTarget`].
+/// xcap handles are not `Send`, so resolution happens per thread/use and the
+/// worker re-resolves by id (see `launch`); the eager first grab below
+/// resolves on the caller's thread instead.
+enum Source {
+    Display(xcap::Monitor),
+    Window(xcap::Window),
+}
+
+/// Resolve `target` to its xcap handle, or describe why it cannot be grabbed.
+fn resolve_source(target: CaptureTarget) -> anyhow::Result<Source> {
+    match target {
+        CaptureTarget::Display(display_id) => xcap::Monitor::all()
+            .context("failed to enumerate displays")?
+            .into_iter()
+            .find(|m| m.id().unwrap_or(u32::MAX) == display_id)
+            .map(Source::Display)
+            .ok_or_else(|| anyhow::anyhow!("display {display_id} not found")),
+        CaptureTarget::Window(window_id) => xcap::Window::all()
+            .context("failed to enumerate windows")?
+            .into_iter()
+            .find(|w| w.id().unwrap_or(u32::MAX) == window_id)
+            .map(Source::Window)
+            .ok_or_else(|| anyhow::anyhow!("window {window_id} not found")),
+    }
+}
+
+/// One grab downscaled to exactly `width`x`height` (the session's contract;
+/// see `grab_loop`). Fails when the OS refuses the grab — notably when
+/// Screen Recording permission is missing, which is also what triggers the
+/// one system prompt, so this must only run on explicit user intent (start),
+/// never on a poll (snapshot/preview).
+fn grab_sized(
+    source: &Source,
+    target: CaptureTarget,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let img = match source {
+        Source::Display(m) => m.capture_image(),
+        Source::Window(w) => w.capture_image(),
+    }
+    .map_err(|e| match target {
+        CaptureTarget::Display(display_id) => {
+            anyhow::anyhow!("capture failed (display {display_id}): {e}")
+        }
+        CaptureTarget::Window(window_id) => {
+            anyhow::anyhow!("capture failed (window {window_id}): {e}")
+        }
+    })?;
+    let rgba = if img.width() == width && img.height() == height {
+        img.into_raw()
+    } else {
+        image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle)
+            .into_raw()
+    };
+    Ok((rgba, width, height))
+}
+
 /// Worker body: resolve the target, then grab at `interval`, downscale to
 /// the requested size, and cache the latest frame. Ends when `stop_flag` is
 /// set or the error budget is exhausted (disconnected display, closed
@@ -773,37 +844,21 @@ fn grab_loop(
     last_error: &Mutex<Option<String>>,
     ema_interval_secs: &Mutex<f64>,
 ) {
-    enum Source {
-        Display(xcap::Monitor),
-        Window(xcap::Window),
-    }
-    let source = match target {
-        CaptureTarget::Display(display_id) => match xcap::Monitor::all()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|m| m.id().unwrap_or(u32::MAX) == display_id)
-        {
-            Some(m) => Source::Display(m),
-            None => {
-                *lock(last_error) = Some(format!(
-                    "display {display_id} not found (disconnected before capture started)"
-                ));
-                return;
-            }
-        },
-        CaptureTarget::Window(window_id) => match xcap::Window::all()
-            .unwrap_or_default()
-            .into_iter()
-            .find(|w| w.id().unwrap_or(u32::MAX) == window_id)
-        {
-            Some(w) => Source::Window(w),
-            None => {
-                *lock(last_error) = Some(format!(
-                    "window {window_id} not found (closed before capture started)"
-                ));
-                return;
-            }
-        },
+    let source = match resolve_source(target) {
+        Ok(source) => source,
+        Err(_) => {
+            // Enumeration failed or the target vanished between validation
+            // and thread start: record and exit instead of panicking.
+            *lock(last_error) = Some(match target {
+                CaptureTarget::Display(display_id) => {
+                    format!("display {display_id} not found (disconnected before capture started)")
+                }
+                CaptureTarget::Window(window_id) => {
+                    format!("window {window_id} not found (closed before capture started)")
+                }
+            });
+            return;
+        }
     };
 
     let mut ema: Option<f64> = None;
@@ -827,24 +882,9 @@ fn grab_loop(
         }
         last_tick = tick;
 
-        let grabbed = match &source {
-            Source::Display(m) => m.capture_image(),
-            Source::Window(w) => w.capture_image(),
-        };
-        match grabbed {
-            Ok(img) => {
+        match grab_sized(&source, target, width, height) {
+            Ok((rgba, width, height)) => {
                 consecutive_errors = 0;
-                let rgba = if img.width() == width && img.height() == height {
-                    img.into_raw()
-                } else {
-                    image::imageops::resize(
-                        &img,
-                        width,
-                        height,
-                        image::imageops::FilterType::Triangle,
-                    )
-                    .into_raw()
-                };
                 *lock(frame) = SharedFrame {
                     rgba,
                     width,
