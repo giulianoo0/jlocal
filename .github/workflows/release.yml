@@ -58,15 +58,32 @@ jobs:
           cp README.md "$STAGE/" || true
           tar -czf "dist/jlocal-${TAG}-${{ matrix.target }}.tar.gz" -C dist "jlocal-${TAG}-${{ matrix.target }}"
 
+      - name: App bundle (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TAG: ${{ github.ref_name }}
+          BIN: target/${{ matrix.target }}/release/jlocal
+        run: ./packaging/make-app.sh dist
+
       - name: DMG (macOS)
         if: runner.os == 'macOS'
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          STAGE="dist/jlocal-${TAG}-${{ matrix.target }}"
-          hdiutil create -volname "jlocal ${TAG}" -srcfolder "$STAGE" -ov -format UDZO \
-            "dist/jlocal-${TAG}-${{ matrix.target }}.dmg"
+          brew install create-dmg
+          STAGE="dist/dmg-staging"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R dist/JLocal.app "$STAGE/"
+          create-dmg \
+            --volname "jlocal ${TAG}" \
+            --window-size 1320 840 \
+            --icon "JLocal.app" 260 460 \
+            --app-drop-link 1060 460 \
+            --background "packaging/dmg-background.png" \
+            "dist/jlocal-${TAG}-${{ matrix.target }}.dmg" \
+            "$STAGE"
 
       - name: Package (windows)
         if: runner.os == 'Windows'

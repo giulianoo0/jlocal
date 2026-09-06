@@ -4,8 +4,8 @@
 //! - `GET /version` -> { name, version }
 //! - `GET /events`  -> SSE: `hello` then 15s heartbeat comments.
 //! - `GET /capabilities`   -> { name, version, capabilities }
-//! - `GET /audio/apps`     -> 501 { error } until native capture lands
-//! - `POST /capture/start` -> 501 { error } until native capture lands
+//! - `GET /audio/apps`     -> { apps } when listable, else 501 { error }
+//! - `POST /capture/start` -> { started, display_id, width, height, fps }
 //! - `POST /capture/stop`  -> { stopped: true }
 //!
 //! Security: Host must be loopback (DNS-rebinding guard); CORS only echoes
@@ -59,6 +59,7 @@ struct CapabilitiesBody {
 #[derive(Serialize)]
 struct ScreenCapabilities {
     available: bool,
+    capture: bool,
     #[serde(rename = "maxWidth")]
     max_width: u32,
     #[serde(rename = "maxHeight")]
@@ -197,6 +198,7 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
         capabilities: CapabilitiesBody {
             screen: ScreenCapabilities {
                 available: s.state.caps.screen,
+                capture: s.state.caps.screen_capture,
                 max_width: 3840,
                 max_height: 2160,
                 max_fps: 60,
@@ -269,26 +271,81 @@ fn capture_size(body: &serde_json::Value) -> (u32, u32, u32) {
     (width, height, fps)
 }
 
+/// What the caller asked for: the primary display, a named one, or garbage.
+/// Garbage is its own variant so a typo'd id fails closed (400) instead of
+/// silently capturing the wrong monitor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayRequest {
+    Primary,
+    Display(u32),
+    Invalid,
+}
+
+/// Requested monitor, if the caller names one. Accepts numbers and numeric
+/// strings — the web picker round-trips ids through JS, where they may
+/// stringify. Explicit null counts as absent (primary).
+fn capture_display_request(body: &serde_json::Value) -> DisplayRequest {
+    let Some(v) = body.get("display_id") else {
+        return DisplayRequest::Primary;
+    };
+    if v.is_null() {
+        return DisplayRequest::Primary;
+    }
+    if let Some(n) = v.as_u64() {
+        return DisplayRequest::Display(n as u32);
+    }
+    match v.as_str().map(str::trim).map(str::parse::<u32>) {
+        Some(Ok(id)) => DisplayRequest::Display(id),
+        _ => DisplayRequest::Invalid,
+    }
+}
+
+/// Pick the session display: the requested id when named, else the primary.
+/// `None` means start must fail (unknown id, or no displays at all).
+fn select_display(
+    displays: &[crate::capture::Display],
+    requested: Option<u32>,
+) -> Option<&crate::capture::Display> {
+    match requested {
+        Some(id) => displays.iter().find(|d| d.id == id),
+        None => displays.first(),
+    }
+}
+
 async fn capture_start(
     State(s): State<ApiState>,
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> impl IntoResponse {
-    // No display picker yet: the primary display is the session.
     // Publish is still unwired (draft-16 has no Rust transport), so a
     // started session serves preview frames only — screen.available
     // stays false and the web UI keeps routing to the browser picker.
-    let (width, height, fps) = capture_size(
-        body.as_ref()
-            .map(|b| &b.0)
-            .unwrap_or(&serde_json::Value::Null),
-    );
+    let body_value = body
+        .as_ref()
+        .map(|b| &b.0)
+        .unwrap_or(&serde_json::Value::Null);
+    let (width, height, fps) = capture_size(body_value);
+    let requested = capture_display_request(body_value);
     let started = (|| -> Result<serde_json::Value, (StatusCode, String)> {
         let displays = crate::capture::list_displays()
             .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-        let display = displays
-            .first()
-            .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no_displays".to_string()))?;
+        if requested == DisplayRequest::Invalid {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "invalid display_id".to_string(),
+            ));
+        }
+        let requested_id = match requested {
+            DisplayRequest::Display(id) => Some(id),
+            _ => None,
+        };
+        let display = select_display(&displays, requested_id).ok_or_else(|| match requested_id {
+            Some(id) => (StatusCode::BAD_REQUEST, format!("display {id} not found")),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_displays".to_string(),
+            ),
+        })?;
         let mut session = crate::capture::CaptureSession::new();
         session
             .start(display.id, width, height, fps)
@@ -915,6 +972,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["name"], "jlocal");
         assert_eq!(v["capabilities"]["screen"]["available"], false);
+        assert_eq!(v["capabilities"]["screen"]["capture"], true);
         assert_eq!(v["capabilities"]["screen"]["maxWidth"], 3840);
         assert_eq!(v["capabilities"]["screen"]["maxHeight"], 2160);
         assert_eq!(v["capabilities"]["screen"]["maxFps"], 60);
@@ -961,6 +1019,41 @@ mod tests {
             super::capture_size(&serde_json::json!({"width": 3840, "height": 2160, "fps": 60})),
             (3840, 2160, 60)
         );
+    }
+
+    #[test]
+    fn capture_display_selection_prefers_requested_id() {
+        use crate::capture::Display;
+        let displays = vec![
+            Display { id: 1, name: "a".into(), width: 1920, height: 1080 },
+            Display { id: 2, name: "b".into(), width: 2560, height: 1440 },
+        ];
+        // No id: primary display. Named id: that display. Unknown id or
+        // empty list: nothing (the handler maps these to 400 / 503).
+        assert_eq!(super::select_display(&displays, None).map(|d| d.id), Some(1));
+        assert_eq!(super::select_display(&displays, Some(2)).map(|d| d.id), Some(2));
+        assert!(super::select_display(&displays, Some(9)).is_none());
+        let empty: Vec<Display> = vec![];
+        assert!(super::select_display(&empty, None).is_none());
+        assert!(super::select_display(&empty, Some(1)).is_none());
+    }
+
+    #[test]
+    fn capture_display_request_classifies_missing_named_and_garbage() {
+        use super::DisplayRequest::{Display, Invalid, Primary};
+        let req = super::capture_display_request;
+        // Absent or null: primary display.
+        assert_eq!(req(&serde_json::Value::Null), Primary);
+        assert_eq!(req(&serde_json::json!({"width": 1920})), Primary);
+        assert_eq!(req(&serde_json::json!({"display_id": null})), Primary);
+        // Numbers and numeric strings name a display.
+        assert_eq!(req(&serde_json::json!({"display_id": 2})), Display(2));
+        assert_eq!(req(&serde_json::json!({"display_id": "2"})), Display(2));
+        // Anything else fails closed (the handler answers 400, never the
+        // wrong monitor).
+        assert_eq!(req(&serde_json::json!({"display_id": "nope"})), Invalid);
+        assert_eq!(req(&serde_json::json!({"display_id": true})), Invalid);
+        assert_eq!(req(&serde_json::json!({"display_id": -1})), Invalid);
     }
 
     #[tokio::test]

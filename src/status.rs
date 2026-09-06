@@ -33,14 +33,30 @@ pub fn default_origins_for_tests() -> Vec<String> {
     default_origins()
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct CapabilityFlags {
     /// Screen capture + relay publish both work end to end.
     pub screen: bool,
+    /// Native frame capture is live: the xcap backend is compiled in on
+    /// every supported OS, so the `/capture/*` preview endpoints serve real
+    /// frames with no runtime probe. Relay publish is still unwired, so
+    /// `screen` stays false and gates publish only.
+    pub screen_capture: bool,
     /// The app list is truly listable on this machine.
     pub app_list: bool,
     /// Local torrenting serves ranged bytes.
     pub torrent: bool,
+}
+
+impl Default for CapabilityFlags {
+    fn default() -> Self {
+        Self {
+            screen: false,
+            screen_capture: true,
+            app_list: false,
+            torrent: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -64,11 +80,12 @@ impl AppState {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         // Evaluated once: the list is a real tap check, not a promise.
-        // Screen stays false until capture + publish both work end to end.
+        // Screen stays false until capture + publish both work end to end;
+        // screen_capture rides along from Default (constant true: the xcap
+        // backend is compiled in on every supported OS).
         let caps = CapabilityFlags {
-            screen: false,
             app_list: !crate::audio::list_apps().is_empty(),
-            torrent: false,
+            ..Default::default()
         };
         Self {
             started_unix,

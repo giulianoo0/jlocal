@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>jlocal</string>
+	<key>CFBundleDisplayName</key>
+	<string>jlocal</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.juntos.jlocal</string>
+	<key>CFBundleVersion</key>
+	<string>@TAG@</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@TAG@</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleExecutable</key>
+	<string>jlocal</string>
+	<key>CFBundleIconFile</key>
+	<string>jlocal</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

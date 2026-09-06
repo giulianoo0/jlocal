@@ -33,13 +33,13 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `GET /health`       | `{name, version, connected, moq, torrent, port}` (`torrent`: `live` when the engine booted) |
 | `GET /version`      | `{name, version}`                                                |
 | `GET /events`       | SSE: `hello` + 15s heartbeats.                                   |
-| `GET /capabilities` | `{name, version, capabilities}` (screen/audio/torrent flags)     |
+| `GET /capabilities` | `{name, version, capabilities}` (`screen.capture`: frame capture live; `screen.available`: relay publish, still `false`; audio/torrent flags) |
 | `GET /audio/apps`   | `{apps:[{id,name}]}` when listable, else `501 {error}`           |
 | `POST /audio/mode`  | `{mode}` persists `all`/`none`/`custom` (mute set preserved)     |
 | `POST /audio/mute`  | `{app, muted}` persists one app toggle                           |
 | `GET /capture/displays` | `[{id,name,width,height}]` from the OS                       |
 | `GET /capture/preview.jpg` | Latest frame JPEG, `404 {error:"idle"}` when stopped     |
-| `POST /capture/start` | `{started,display_id,width,height,fps}` (primary display; preview only — publish unwired, see below) |
+| `POST /capture/start` | `{display_id,width,height,fps}` → `{started,display_id,width,height,fps}` (absent `display_id` means primary; unknown id is `400`; preview only — publish unwired, see below) |
 | `POST /capture/stop`  | `{stopped:true}` (idempotent, always 200)                      |
 | `POST /torrent/add` | `{id, name}` (waits ≤60s for magnet metadata; `504` on timeout)  |
 | `GET /torrent/list` | `{torrents:[{id,name,size,progress,state,downBps,files}]}`        |
@@ -61,7 +61,8 @@ engine's lookahead) and fail after 90s per read (`504`).
 Screen publish is still unwired: the relay speaks MoQ draft-16 and no Rust
 crate negotiates it (draft-18+/moq-lite only), so `screen.available` stays
 `false` and the web UI keeps routing to the browser picker. Capture
-endpoints above are live (real frames), ready for a transport when one exists.
+endpoints above are live (real frames, advertised as `screen.capture`),
+ready for a transport when one exists.
 
 Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
 (comma-separated `https://` origins, replaces the juntos.lol + beta defaults),
