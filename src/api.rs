@@ -3,6 +3,10 @@
 //! - `GET /health`  -> { name, version, connected, moq, torrent, port }
 //! - `GET /version` -> { name, version }
 //! - `GET /events`  -> SSE: `hello` then 15s heartbeat comments.
+//! - `GET /capabilities`   -> { name, version, capabilities }
+//! - `GET /audio/apps`     -> 501 { error } until native capture lands
+//! - `POST /capture/start` -> 501 { error } until native capture lands
+//! - `POST /capture/stop`  -> { stopped: true }
 //!
 //! Security: Host must be loopback (DNS-rebinding guard); CORS only echoes
 //! allowlisted origins (`JLOCAL_ALLOWED_ORIGINS`); everything is `no-store`.
@@ -15,7 +19,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Response, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 
@@ -38,14 +42,58 @@ struct Version<'a> {
     version: &'a str,
 }
 
+#[derive(Serialize)]
+struct Capabilities<'a> {
+    name: &'a str,
+    version: &'a str,
+    capabilities: CapabilitiesBody,
+}
+
+#[derive(Serialize)]
+struct CapabilitiesBody {
+    screen: ScreenCapabilities,
+    audio: AudioCapabilities,
+    torrent: TorrentCapabilities,
+}
+
+#[derive(Serialize)]
+struct ScreenCapabilities {
+    available: bool,
+    #[serde(rename = "maxWidth")]
+    max_width: u32,
+    #[serde(rename = "maxHeight")]
+    max_height: u32,
+    #[serde(rename = "maxFps")]
+    max_fps: u32,
+}
+
+#[derive(Serialize)]
+struct AudioCapabilities {
+    #[serde(rename = "appList")]
+    app_list: bool,
+}
+
+#[derive(Serialize)]
+struct TorrentCapabilities {
+    available: bool,
+}
+
 pub fn router(state: AppState, port: u16) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/events", get(events))
+        .route("/capabilities", get(capabilities))
+        .route("/audio/apps", get(audio_apps))
+        .route("/capture/start", post(capture_start))
+        .route("/capture/stop", post(capture_stop))
         .route("/health", axum::routing::options(preflight))
         .route("/version", axum::routing::options(preflight))
         .route("/events", axum::routing::options(preflight))
+        .route("/capabilities", axum::routing::options(preflight))
+        .route("/audio/apps", axum::routing::options(preflight))
+        .route("/capture/start", axum::routing::options(preflight))
+        .route("/capture/stop", axum::routing::options(preflight))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_loopback_host,
@@ -119,6 +167,56 @@ async fn events(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoRespo
     with_no_store(res)
 }
 
+async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let body = Capabilities {
+        name: crate::status::NAME,
+        version: crate::status::VERSION,
+        capabilities: CapabilitiesBody {
+            screen: ScreenCapabilities {
+                available: false,
+                max_width: 3840,
+                max_height: 2160,
+                max_fps: 60,
+            },
+            audio: AudioCapabilities { app_list: false },
+            torrent: TorrentCapabilities { available: false },
+        },
+    };
+    let mut res = Json(body).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn audio_apps(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let mut res = (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "not_implemented"})),
+    )
+        .into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn capture_start(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    _body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let mut res = (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({"error": "not_implemented"})),
+    )
+        .into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn capture_stop(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let mut res = Json(serde_json::json!({"stopped": true})).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
 /// DNS-rebinding guard: only loopback Host values may talk to us.
 async fn require_loopback_host(
     State(state): State<AppState>,
@@ -171,7 +269,6 @@ fn apply_cors(state: &AppState, req_headers: &HeaderMap, res_headers: &mut Heade
         HeaderValue::from_static("600"),
     );
 }
-
 
 fn with_no_store(mut res: Response) -> Response {
     res.headers_mut().insert(
@@ -230,9 +327,12 @@ mod tests {
 
     #[tokio::test]
     async fn health_echoes_allowed_origin() {
-        let res = health(State(state_with(&["https://beta.juntos.lol"])), origin_headers("https://beta.juntos.lol"))
-            .await
-            .into_response();
+        let res = health(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
         assert_eq!(
             res.headers()
                 .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
@@ -246,9 +346,12 @@ mod tests {
 
     #[tokio::test]
     async fn health_omits_unknown_origin() {
-        let res = health(State(state_with(&["https://beta.juntos.lol"])), origin_headers("https://evil.test"))
-            .await
-            .into_response();
+        let res = health(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://evil.test"),
+        )
+        .await
+        .into_response();
         assert!(!res
             .headers()
             .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN));
@@ -263,5 +366,104 @@ mod tests {
             );
         }
         assert!(!"evil.com".starts_with("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn capabilities_shape_and_echoes_allowed_origin() {
+        let res = capabilities(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["name"], "jlocal");
+        assert_eq!(v["capabilities"]["screen"]["available"], false);
+        assert_eq!(v["capabilities"]["screen"]["maxWidth"], 3840);
+        assert_eq!(v["capabilities"]["screen"]["maxHeight"], 2160);
+        assert_eq!(v["capabilities"]["screen"]["maxFps"], 60);
+        assert_eq!(v["capabilities"]["audio"]["appList"], false);
+        assert_eq!(v["capabilities"]["torrent"]["available"], false);
+    }
+
+    #[tokio::test]
+    async fn audio_apps_returns_501_with_allowlist_cors() {
+        let res = audio_apps(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"error": "not_implemented"}));
+    }
+
+    #[tokio::test]
+    async fn capture_start_returns_501() {
+        let res = capture_start(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"error": "not_implemented"}));
+    }
+
+    #[tokio::test]
+    async fn capture_stop_returns_200_stopped() {
+        let res = capture_stop(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"stopped": true}));
     }
 }

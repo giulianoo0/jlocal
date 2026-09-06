@@ -41,8 +41,8 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let allowed_origins =
-            std::env::var("JLOCAL_ALLOWED_ORIGINS").map_or_else(|_| default_origins(), |v| parse_origins(&v));
+        let allowed_origins = std::env::var("JLOCAL_ALLOWED_ORIGINS")
+            .map_or_else(|_| default_origins(), |v| parse_origins(&v));
         let started_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())

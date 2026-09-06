@@ -28,16 +28,27 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 
 ## Loopback API (127.0.0.1 only, fixed port)
 
-| Endpoint      | Description                                                      |
-|---------------|------------------------------------------------------------------|
-| `GET /health` | `{name, version, connected, moq, torrent, port}`                  |
-| `GET /version`| `{name, version}`                                                |
-| `GET /events` | SSE: `hello` + 15s heartbeats.                                   |
+| Endpoint            | Description                                                      |
+|---------------------|------------------------------------------------------------------|
+| `GET /health`       | `{name, version, connected, moq, torrent, port}`                  |
+| `GET /version`      | `{name, version}`                                                |
+| `GET /events`       | SSE: `hello` + 15s heartbeats.                                   |
+| `GET /capabilities` | `{name, version, capabilities}` (screen/audio/torrent flags)     |
+| `GET /audio/apps`   | `501 {error}` until native capture lands (future: `apps` SSE)    |
+| `POST /capture/start` | `501 {error}` until native capture lands (future: `{preview, session}`) |
+| `POST /capture/stop`  | `{stopped:true}` (idempotent, always 200)                        |
 
 Security: `Host` must be loopback (DNS-rebinding guard); CORS echoes
 allowlisted origins (`Access-Control-Allow-Origin` + Vary) on every endpoint
 including `GET /health`; `Access-Control-Allow-Private-Network: true`;
 `Cache-Control: no-store`. Browsers should `fetch` (not `EventSource`).
+
+Screen/audio capture is contract-only for now: `GET /capabilities` advertises
+`screen.available: false` / `audio.appList: false` / `torrent.available: false`,
+and `GET /audio/apps` + `POST /capture/start` answer `501 {error:
+"not_implemented"}` until the native capture phase lands. The web UI probes
+`/capabilities` and meanwhile falls back to the browser picker
+(`getDisplayMedia`), so nothing breaks while the contract is stubbed.
 
 Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
 (comma-separated `https://` origins, replaces the juntos.lol + beta defaults),
