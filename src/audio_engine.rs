@@ -802,7 +802,7 @@ mod macos {
 mod windows {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::{implement, Ref, GUID, HRESULT};
+    use windows_core::{implement, Ref, GUID, HRESULT};
     use windows::Win32::Media::Audio::{
         ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
         IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
@@ -845,18 +845,18 @@ mod windows {
     /// with the activated `IAudioClient` (or the failure).
     #[implement(IActivateAudioInterfaceCompletionHandler)]
     struct ActivationHandler {
-        tx: std::sync::mpsc::Sender<windows::core::Result<IAudioClient>>,
+        tx: std::sync::mpsc::Sender<windows_core::Result<IAudioClient>>,
     }
 
     impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler {
         fn ActivateCompleted(
             &self,
             operation: Ref<'_, IActivateAudioInterfaceAsyncOperation>,
-        ) -> windows::core::Result<()> {
-            let result: windows::core::Result<IAudioClient> = unsafe {
+        ) -> windows_core::Result<()> {
+            let result: windows_core::Result<IAudioClient> = unsafe {
                 operation
                     .as_ref()
-                    .ok_or_else(|| windows::core::Error::from(HRESULT(-2147467259)))
+                    .ok_or_else(|| windows_core::Error::from(HRESULT(-2147467259)))
                     .and_then(|op| op.GetActivateResult())
             };
             let _ = self.tx.send(result);
@@ -891,7 +891,7 @@ mod windows {
         };
         let prop = InitPropVariantFromBuffer(blob)
             .map_err(|e| anyhow::anyhow!("activation params failed: {e}"))?;
-        let (tx, rx) = std::sync::mpsc::channel::<windows::core::Result<IAudioClient>>();
+        let (tx, rx) = std::sync::mpsc::channel::<windows_core::Result<IAudioClient>>();
         let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler { tx }.into();
         let path: Vec<u16> = std::ffi::OsStr::new(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK)
             .encode_wide()
@@ -899,7 +899,7 @@ mod windows {
             .collect();
         let operation = unsafe {
             ActivateAudioInterfaceAsync(
-                windows::core::PCWSTR(path.as_ptr()),
+                windows_core::PCWSTR(path.as_ptr()),
                 &IAudioClient::IID,
                 Some(&prop),
                 &handler,
