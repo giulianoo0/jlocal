@@ -69,6 +69,9 @@ pub struct AppState {
     /// Local torrent engine. `None` until the async session boots at
     /// startup; handlers answer 503 while it is absent.
     pub torrent: Option<crate::torrent::TorrentManager>,
+    /// Self-update status: the background poller records the newest newer
+    /// tag here; the window title and tray menu read it.
+    pub update: std::sync::Arc<parking_lot::Mutex<crate::update::UpdateState>>,
 }
 
 impl AppState {
@@ -94,6 +97,9 @@ impl AppState {
             capture: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             audio: std::sync::Arc::new(parking_lot::Mutex::new(crate::audio::AudioState::new())),
             torrent: None,
+            update: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::update::UpdateState::default(),
+            )),
         }
     }
 }
@@ -102,4 +108,21 @@ impl Default for AppState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Window title + console status line: version, loopback endpoint, live
+/// capture-permission state, and the pending update when one is known.
+/// `update_tag` is `AppState.update.latest_tag` — `None` on a fresh boot
+/// (the first check hasn't landed yet) or when up-to-date.
+pub fn window_title(port: u16, update_tag: Option<&str>) -> String {
+    let permission = if crate::permissions::screen_capture_granted() {
+        "capture allowed"
+    } else {
+        "capture blocked — enable Screen Recording"
+    };
+    let mut title = format!("jlocal {VERSION} — connected (127.0.0.1:{port}) — {permission}");
+    if let Some(tag) = update_tag {
+        title.push_str(&format!(" — update available {tag}"));
+    }
+    title
 }

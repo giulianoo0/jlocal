@@ -5,6 +5,8 @@
 pub mod api;
 pub mod audio;
 pub mod capture;
+pub mod permissions;
 pub mod publish;
 pub mod status;
 pub mod torrent;
+pub mod update;

@@ -5,8 +5,9 @@
 //! - `GET /events`  -> SSE: `hello` then 15s heartbeat comments.
 //! - `GET /capabilities`   -> { name, version, capabilities }
 //! - `GET /audio/apps`     -> { apps } when listable, else 501 { error }
-//! - `POST /capture/start` -> { started, display_id, width, height, fps }
+//! - `POST /capture/start` -> { started, display_id|window_id, width, height, fps }
 //! - `POST /capture/stop`  -> { stopped: true }
+//! - `GET /capture/snapshot` -> one-frame JPEG (`?display_id=<id|empty=primary>` xor `?window_id=<id>`, `&width=<px>`)
 //!
 //! Security: Host must be loopback (DNS-rebinding guard); CORS only echoes
 //! allowlisted origins (`JLOCAL_ALLOWED_ORIGINS`); everything is `no-store`.
@@ -14,7 +15,7 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive};
@@ -54,8 +55,8 @@ struct CapabilitiesBody {
     screen: ScreenCapabilities,
     audio: AudioCapabilities,
     torrent: TorrentCapabilities,
+    permissions: PermissionCapabilities,
 }
-
 #[derive(Serialize)]
 struct ScreenCapabilities {
     available: bool,
@@ -79,6 +80,11 @@ struct TorrentCapabilities {
     available: bool,
 }
 
+#[derive(Serialize)]
+struct PermissionCapabilities {
+    #[serde(rename = "screenCapture")]
+    screen_capture: bool,
+}
 pub fn router(state: AppState, port: u16) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -89,7 +95,9 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/audio/mode", post(audio_mode))
         .route("/audio/mute", post(audio_mute))
         .route("/capture/displays", get(capture_displays))
+        .route("/capture/windows", get(capture_windows))
         .route("/capture/preview.jpg", get(capture_preview))
+        .route("/capture/snapshot", get(capture_snapshot))
         .route("/capture/start", post(capture_start))
         .route("/capture/stop", post(capture_stop))
         .route("/torrent/add", post(torrent_add))
@@ -104,9 +112,10 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/capabilities", axum::routing::options(preflight))
         .route("/audio/apps", axum::routing::options(preflight))
         .route("/audio/mode", axum::routing::options(preflight))
-        .route("/audio/mute", axum::routing::options(preflight))
         .route("/capture/displays", axum::routing::options(preflight))
+        .route("/capture/windows", axum::routing::options(preflight))
         .route("/capture/preview.jpg", axum::routing::options(preflight))
+        .route("/capture/snapshot", axum::routing::options(preflight))
         .route("/capture/start", axum::routing::options(preflight))
         .route("/capture/stop", axum::routing::options(preflight))
         .route("/torrent/add", axum::routing::options(preflight))
@@ -209,6 +218,11 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
             torrent: TorrentCapabilities {
                 available: s.state.caps.torrent,
             },
+            permissions: PermissionCapabilities {
+                // Live probe, report-only: never prompts, so reading it per
+                // request stays honest if the user grants access mid-run.
+                screen_capture: crate::permissions::screen_capture_granted(),
+            },
         },
     };
     let mut res = Json(body).into_response();
@@ -245,6 +259,19 @@ async fn capture_displays(State(s): State<ApiState>, headers: HeaderMap) -> impl
     with_no_store(res)
 }
 
+async fn capture_windows(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let mut res = match crate::capture::list_windows() {
+        Ok(windows) => Json(serde_json::json!({"windows": windows})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
 async fn capture_preview(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     let jpeg = s
         .state
@@ -264,6 +291,102 @@ async fn capture_preview(State(s): State<ApiState>, headers: HeaderMap) -> impl 
     with_no_store(res)
 }
 
+/// One-shot frame grab for picker previews: `GET /capture/snapshot` returns
+/// exactly one JPEG frame for `?display_id=<id>` (empty value = primary) xor
+/// `?window_id=<id>`, downscaled to `&width=<px>` (default 960, clamped
+/// `160..=1920`) keeping the aspect ratio.
+///
+/// - Exactly one id key: both or neither is a 400, never a guess. Garbage
+///   ids fail closed (400); unknown ids are 400, never 503.
+/// - Any capture failure is 503: `{error:"permission"}` when the OS probe
+///   says capture is blocked, else `{error:"unavailable"}`.
+/// - Stateless: never touches `AppState::capture`, so a running session
+///   keeps grabbing undisturbed (`State` is only read for CORS origins).
+async fn capture_snapshot(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    enum Target {
+        Display(Option<u32>),
+        Window(u32),
+    }
+    let target: Result<Target, String> = match (
+        params.get("display_id"),
+        params.get("window_id"),
+    ) {
+        (Some(_), Some(_)) => Err("only one of display_id, window_id".to_string()),
+        (None, None) => Err("display_id or window_id required".to_string()),
+        (Some(raw), None) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(Target::Display(None))
+            } else {
+                trimmed
+                    .parse::<u32>()
+                    .map(|id| Target::Display(Some(id)))
+                    .map_err(|_| "invalid display_id".to_string())
+            }
+        }
+        (None, Some(raw)) => raw
+            .trim()
+            .parse::<u32>()
+            .map(Target::Window)
+            .map_err(|_| "invalid window_id".to_string()),
+    };
+    // Lenient like `capture_size`: missing, empty, or non-numeric widths
+    // fall back to the default; out-of-range values clamp (never 400 — the
+    // target is already validated above, so the size cannot misroute).
+    let width = crate::capture::clamp_snapshot_width(
+        params
+            .get("width")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(crate::capture::SNAPSHOT_DEFAULT_WIDTH),
+    );
+    let snapshot: Result<Vec<u8>, (StatusCode, String)> = (|| {
+        let target = target.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        match target {
+            Target::Display(requested) => {
+                let displays =
+                    crate::capture::list_displays().map_err(|_| snapshot_unavailable())?;
+                let display = select_display(&displays, requested).ok_or_else(|| match requested {
+                    Some(id) => (StatusCode::BAD_REQUEST, format!("display {id} not found")),
+                    None => snapshot_unavailable(),
+                })?;
+                crate::capture::snapshot_display(display.id, width)
+                    .map_err(|_| snapshot_unavailable())
+            }
+            Target::Window(id) => {
+                let windows =
+                    crate::capture::list_windows().map_err(|_| snapshot_unavailable())?;
+                let window = select_window(&windows, id)
+                    .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("window {id} not found")))?;
+                crate::capture::snapshot_window(window.id, width)
+                    .map_err(|_| snapshot_unavailable())
+            }
+        }
+    })();
+    let mut res = match snapshot {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
+        Err((status, error)) => {
+            (status, Json(serde_json::json!({"error": error}))).into_response()
+        }
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+/// 503 for a failed snapshot: `permission` when the OS probe says capture is
+/// blocked (the user must grant Screen Recording), else `unavailable`.
+fn snapshot_unavailable() -> (StatusCode, String) {
+    let error = if crate::permissions::screen_capture_granted() {
+        "unavailable"
+    } else {
+        "permission"
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+}
+
 fn capture_size(body: &serde_json::Value) -> (u32, u32, u32) {
     let width = body.get("width").and_then(|v| v.as_u64()).unwrap_or(1920) as u32;
     let height = body.get("height").and_then(|v| v.as_u64()).unwrap_or(1080) as u32;
@@ -271,9 +394,9 @@ fn capture_size(body: &serde_json::Value) -> (u32, u32, u32) {
     (width, height, fps)
 }
 
-/// What the caller asked for: the primary display, a named one, or garbage.
-/// Garbage is its own variant so a typo'd id fails closed (400) instead of
-/// silently capturing the wrong monitor.
+/// What the caller asked for: a named display, nothing, or garbage. Absent
+/// and null both mean "no display target" (the window half decides); garbage
+/// fails closed (400) instead of capturing the wrong monitor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DisplayRequest {
     Primary,
@@ -283,7 +406,7 @@ enum DisplayRequest {
 
 /// Requested monitor, if the caller names one. Accepts numbers and numeric
 /// strings — the web picker round-trips ids through JS, where they may
-/// stringify. Explicit null counts as absent (primary).
+/// stringify. Explicit null counts as absent.
 fn capture_display_request(body: &serde_json::Value) -> DisplayRequest {
     let Some(v) = body.get("display_id") else {
         return DisplayRequest::Primary;
@@ -311,6 +434,43 @@ fn select_display(
         None => displays.first(),
     }
 }
+/// What the caller asked for: a named window, nothing, or garbage. Absent
+/// and null both mean "no window target" (the display half decides); garbage
+/// fails closed (400) instead of capturing the wrong window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowRequest {
+    Absent,
+    Window(u32),
+    Invalid,
+}
+
+/// Requested window, if the caller names one. Accepts numbers and numeric
+/// strings — the web picker round-trips ids through JS, where they may
+/// stringify. Explicit null counts as absent.
+fn capture_window_request(body: &serde_json::Value) -> WindowRequest {
+    let Some(v) = body.get("window_id") else {
+        return WindowRequest::Absent;
+    };
+    if v.is_null() {
+        return WindowRequest::Absent;
+    }
+    if let Some(n) = v.as_u64() {
+        return WindowRequest::Window(n as u32);
+    }
+    match v.as_str().map(str::trim).map(str::parse::<u32>) {
+        Some(Ok(id)) => WindowRequest::Window(id),
+        _ => WindowRequest::Invalid,
+    }
+}
+
+/// Pick the session window by id. `None` means start must fail with 400
+/// (unknown id — e.g. closed since `/capture/windows`).
+fn select_window(
+    windows: &[crate::capture::Window],
+    requested: u32,
+) -> Option<&crate::capture::Window> {
+    windows.iter().find(|w| w.id == requested)
+}
 
 async fn capture_start(
     State(s): State<ApiState>,
@@ -325,37 +485,59 @@ async fn capture_start(
         .map(|b| &b.0)
         .unwrap_or(&serde_json::Value::Null);
     let (width, height, fps) = capture_size(body_value);
-    let requested = capture_display_request(body_value);
+    let requested_display = capture_display_request(body_value);
+    let requested_window = capture_window_request(body_value);
     let started = (|| -> Result<serde_json::Value, (StatusCode, String)> {
-        let displays = crate::capture::list_displays()
-            .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-        if requested == DisplayRequest::Invalid {
-            return Err((
+        // Exactly one target: both or neither is a 400, never a guess.
+        // Garbage ids fail closed before any OS enumeration runs.
+        match (requested_display, requested_window) {
+            (DisplayRequest::Invalid, _) => {
+                Err((StatusCode::BAD_REQUEST, "invalid display_id".to_string()))
+            }
+            (_, WindowRequest::Invalid) => {
+                Err((StatusCode::BAD_REQUEST, "invalid window_id".to_string()))
+            }
+            (DisplayRequest::Display(_), WindowRequest::Window(_)) => Err((
                 StatusCode::BAD_REQUEST,
-                "invalid display_id".to_string(),
-            ));
+                "only one of display_id, window_id".to_string(),
+            )),
+            (DisplayRequest::Primary, WindowRequest::Absent) => Err((
+                StatusCode::BAD_REQUEST,
+                "display_id or window_id required".to_string(),
+            )),
+            (DisplayRequest::Display(id), WindowRequest::Absent) => {
+                let displays = crate::capture::list_displays()
+                    .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+                let display = select_display(&displays, Some(id))
+                    .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("display {id} not found")))?;
+                let mut session = crate::capture::CaptureSession::new();
+                session
+                    .start(display.id, width, height, fps)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                let live_id = session.display_id();
+                let (got_w, got_h, got_fps) = (width, height, session.fps());
+                s.state.capture.lock().replace(session);
+                Ok(
+                    serde_json::json!({"started": true, "display_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
+                )
+            }
+            (DisplayRequest::Primary, WindowRequest::Window(id)) => {
+                let windows = crate::capture::list_windows()
+                    .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+                let window = select_window(&windows, id)
+                    .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("window {id} not found")))?;
+                let mut session = crate::capture::CaptureSession::new();
+                session
+                    .start_window(window.id, width, height, fps)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+                let live_id = session.window_id();
+                let (got_w, got_h, got_fps) = (width, height, session.fps());
+                s.state.capture.lock().replace(session);
+                Ok(
+                    serde_json::json!({"started": true, "window_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
+                )
+            }
         }
-        let requested_id = match requested {
-            DisplayRequest::Display(id) => Some(id),
-            _ => None,
-        };
-        let display = select_display(&displays, requested_id).ok_or_else(|| match requested_id {
-            Some(id) => (StatusCode::BAD_REQUEST, format!("display {id} not found")),
-            None => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_displays".to_string(),
-            ),
-        })?;
-        let mut session = crate::capture::CaptureSession::new();
-        session
-            .start(display.id, width, height, fps)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        let (got_w, got_h, got_fps) = (width, height, session.fps());
-        let live_id = session.display_id();
-        s.state.capture.lock().replace(session);
-        Ok(
-            serde_json::json!({"started": true, "display_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
-        )
     })();
     let mut res = match started {
         Ok(body) => Json(body).into_response(),
@@ -364,6 +546,7 @@ async fn capture_start(
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
+
 async fn capture_stop(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     *s.state.capture.lock() = None;
     let mut res = Json(serde_json::json!({"stopped": true})).into_response();
@@ -890,6 +1073,9 @@ mod tests {
                     parking_lot::Mutex::new(crate::audio::AudioState::new()),
                 ),
                 torrent: None,
+                update: std::sync::Arc::new(parking_lot::Mutex::new(
+                    crate::update::UpdateState::default(),
+                )),
             },
             port: 40392,
         }
@@ -1025,13 +1211,29 @@ mod tests {
     fn capture_display_selection_prefers_requested_id() {
         use crate::capture::Display;
         let displays = vec![
-            Display { id: 1, name: "a".into(), width: 1920, height: 1080 },
-            Display { id: 2, name: "b".into(), width: 2560, height: 1440 },
+            Display {
+                id: 1,
+                name: "a".into(),
+                width: 1920,
+                height: 1080,
+            },
+            Display {
+                id: 2,
+                name: "b".into(),
+                width: 2560,
+                height: 1440,
+            },
         ];
         // No id: primary display. Named id: that display. Unknown id or
         // empty list: nothing (the handler maps these to 400 / 503).
-        assert_eq!(super::select_display(&displays, None).map(|d| d.id), Some(1));
-        assert_eq!(super::select_display(&displays, Some(2)).map(|d| d.id), Some(2));
+        assert_eq!(
+            super::select_display(&displays, None).map(|d| d.id),
+            Some(1)
+        );
+        assert_eq!(
+            super::select_display(&displays, Some(2)).map(|d| d.id),
+            Some(2)
+        );
         assert!(super::select_display(&displays, Some(9)).is_none());
         let empty: Vec<Display> = vec![];
         assert!(super::select_display(&empty, None).is_none());
@@ -1054,6 +1256,95 @@ mod tests {
         assert_eq!(req(&serde_json::json!({"display_id": "nope"})), Invalid);
         assert_eq!(req(&serde_json::json!({"display_id": true})), Invalid);
         assert_eq!(req(&serde_json::json!({"display_id": -1})), Invalid);
+    }
+
+    #[test]
+    fn capture_window_request_classifies_missing_named_and_garbage() {
+        use super::WindowRequest::{Absent, Invalid, Window};
+        let req = super::capture_window_request;
+        // Absent or null: no window target.
+        assert_eq!(req(&serde_json::Value::Null), Absent);
+        assert_eq!(req(&serde_json::json!({"width": 1920})), Absent);
+        assert_eq!(req(&serde_json::json!({"window_id": null})), Absent);
+        // Numbers and numeric strings name a window.
+        assert_eq!(req(&serde_json::json!({"window_id": 7})), Window(7));
+        assert_eq!(req(&serde_json::json!({"window_id": "7"})), Window(7));
+        // Anything else fails closed (the handler answers 400, never the
+        // wrong window).
+        assert_eq!(req(&serde_json::json!({"window_id": "nope"})), Invalid);
+        assert_eq!(req(&serde_json::json!({"window_id": true})), Invalid);
+        assert_eq!(req(&serde_json::json!({"window_id": -1})), Invalid);
+    }
+
+    #[test]
+    fn capture_window_selection_finds_exact_id() {
+        use crate::capture::Window;
+        let windows = vec![
+            Window {
+                id: 3,
+                name: "a".into(),
+                width: 800,
+                height: 600,
+            },
+            Window {
+                id: 5,
+                name: "b".into(),
+                width: 1024,
+                height: 768,
+            },
+        ];
+        assert_eq!(super::select_window(&windows, 5).map(|w| w.id), Some(5));
+        assert!(super::select_window(&windows, 9).is_none());
+        let empty: Vec<Window> = vec![];
+        assert!(super::select_window(&empty, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_start_needs_exactly_one_target() {
+        // Both / neither / garbage never reach the OS: the 400 is
+        // headless-safe and deterministic on every machine.
+        for body in [
+            serde_json::json!({"display_id": 1, "window_id": 2}),
+            serde_json::json!({"width": 1920}),
+            serde_json::json!({"display_id": "nope"}),
+            serde_json::json!({"window_id": true}),
+        ] {
+            let res = capture_start(
+                State(state_with(&["https://beta.juntos.lol"])),
+                origin_headers("https://beta.juntos.lol"),
+                Some(Json(body)),
+            )
+            .await
+            .into_response();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let raw = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert!(v.get("error").is_some(), "{v}");
+        }
+        // Missing body entirely is "neither" too.
+        let res = capture_start(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+            None,
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_permission_probe() {
+        let res = capabilities(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        let raw = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        // Report-only probe: a real boolean, whatever this machine says.
+        assert!(v["capabilities"]["permissions"]["screenCapture"].is_boolean());
     }
 
     #[tokio::test]
@@ -1280,5 +1571,84 @@ mod tests {
         .await
         .into_response();
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    fn snapshot_query(pairs: &[(&str, &str)]) -> Query<std::collections::HashMap<String, String>> {
+        Query(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn snapshot_needs_exactly_one_target() {
+        // Both / neither / garbage never reach the OS: the 400 is
+        // headless-safe and deterministic on every machine.
+        for query in [
+            snapshot_query(&[("display_id", "1"), ("window_id", "2")]),
+            snapshot_query(&[]),
+            snapshot_query(&[("width", "960")]),
+            snapshot_query(&[("display_id", "nope")]),
+            snapshot_query(&[("display_id", "-1")]),
+            snapshot_query(&[("display_id", "1.5")]),
+            snapshot_query(&[("window_id", "true")]),
+            snapshot_query(&[("window_id", "")]),
+        ] {
+            let res = capture_snapshot(
+                State(state_with(&["https://beta.juntos.lol"])),
+                origin_headers("https://beta.juntos.lol"),
+                query,
+            )
+            .await
+            .into_response();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store")
+            );
+            let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(v.get("error").is_some(), "{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_unknown_id_is_400_not_503() {
+        // u32::MAX can never be a live target, but resolving it still lists
+        // real targets — so this only runs where enumeration works. Where it
+        // does, unknown must be 400 (stale picker entry), never 503.
+        if crate::capture::list_displays().is_err() {
+            return;
+        }
+        let res = capture_snapshot(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+            snapshot_query(&[("display_id", &u32::MAX.to_string())]),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("error").is_some(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_unavailable_maps_permission_probe() {
+        // The 503 error string is whatever the live probe says: `permission`
+        // when the OS blocks capture, else `unavailable`. Either way the
+        // envelope + no-store contract holds.
+        let (status, error) = super::snapshot_unavailable();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let expected = if crate::permissions::screen_capture_granted() {
+            "unavailable"
+        } else {
+            "permission"
+        };
+        assert_eq!(error, expected);
     }
 }

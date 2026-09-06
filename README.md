@@ -7,11 +7,12 @@ share screen up to 4K60 via the MoQ relay, all through one tiny native app.
 
 The app itself has no web UI. It shows two things:
 
-- **status**: connected / not connected (window title + console + `/health`)
+- **status**: connected / not connected + capture permission (window title + console + `/capabilities` → `permissions.screenCapture`)
 - **version**: the release tag (window title + `/version` + `--version`)
 
-Everything else (preview, resolution/fps picker, per-app audio toggles) lives
-in the juntos.lol web UI, which talks to this app over loopback.
+It also lives in the menubar tray (monotone icon): closing the window hides
+to the tray instead of quitting; the tray menu has Open + Check-for-updates
++ Install-update (when one is known) + Quit.
 
 ## Quickstart
 
@@ -33,13 +34,15 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `GET /health`       | `{name, version, connected, moq, torrent, port}` (`torrent`: `live` when the engine booted) |
 | `GET /version`      | `{name, version}`                                                |
 | `GET /events`       | SSE: `hello` + 15s heartbeats.                                   |
-| `GET /capabilities` | `{name, version, capabilities}` (`screen.capture`: frame capture live; `screen.available`: relay publish, still `false`; audio/torrent flags) |
+| `GET /capabilities` | `{name, version, capabilities}` (`screen.capture`: frame capture live; `screen.available`: relay publish, still `false`; audio/torrent flags; `permissions.screenCapture`: OS capture consent, live probe) |
 | `GET /audio/apps`   | `{apps:[{id,name}]}` when listable, else `501 {error}`           |
 | `POST /audio/mode`  | `{mode}` persists `all`/`none`/`custom` (mute set preserved)     |
 | `POST /audio/mute`  | `{app, muted}` persists one app toggle                           |
-| `GET /capture/displays` | `[{id,name,width,height}]` from the OS                       |
+| `GET /capture/displays` | `{displays:[{id,name,width,height}]}` from the OS           |
+| `GET /capture/windows` | `{windows:[{id,name,width,height}]}` from the OS (minimized/zero-area skipped) |
 | `GET /capture/preview.jpg` | Latest frame JPEG, `404 {error:"idle"}` when stopped     |
-| `POST /capture/start` | `{display_id,width,height,fps}` → `{started,display_id,width,height,fps}` (absent `display_id` means primary; unknown id is `400`; preview only — publish unwired, see below) |
+| `GET /capture/snapshot` | One-frame JPEG for picker previews: `?display_id=<id\|empty=primary>` xor `?window_id=<id>`, `&width=<px>` (default 960, clamp 160–1920, aspect kept); `200 image/jpeg`; `400` both/neither/garbage/unknown id; `503 {error:"permission"\|"unavailable"}` (stateless — never touches the running session) |
+| `POST /capture/start` | `{display_id _xor_ window_id,width,height,fps}` → `{started,display_id\|window_id,width,height,fps}` (exactly one id; unknown id is `400`; a window closed mid-session ends frames so preview `404`s; preview only — publish unwired, see below) |
 | `POST /capture/stop`  | `{stopped:true}` (idempotent, always 200)                      |
 | `POST /torrent/add` | `{id, name}` (waits ≤60s for magnet metadata; `504` on timeout)  |
 | `GET /torrent/list` | `{torrents:[{id,name,size,progress,state,downBps,files}]}`        |
@@ -67,6 +70,19 @@ ready for a transport when one exists.
 Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
 (comma-separated `https://` origins, replaces the juntos.lol + beta defaults),
 `JLOCAL_VERSION` (injected by release CI).
+
+## Self-update
+
+On boot and every 6h the app checks
+`https://api.github.com/giulianoo0/jlocal/releases/latest` (10s timeout,
+best-effort, never blocks boot). When the tag is newer than its own build
+it shows `update available vX` in the window title and enables the tray's
+`Install update vX` item (plus a manual `Check for updates now` item).
+Install downloads the release asset for the OS (`jlocal-<tag>-<target>.tar.gz`
+on macOS/Linux, `.zip` on Windows — the exact names `release.yml` uploads),
+swaps its own executable (inside `JLocal.app` it replaces
+`Contents/MacOS/jlocal` and re-opens the bundle), and relaunches. No forced
+updates, and no signature verification beyond HTTPS.
 
 ## Install (per OS)
 

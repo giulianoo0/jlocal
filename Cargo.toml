@@ -17,11 +17,19 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
  xcap = "0.9"
- image = { version = "0.25", default-features = false, features = ["jpeg"] }
+ image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 librqbit = "9"
  sysinfo = "0.39"
 parking_lot = "0.12"
 winit = "0.30"
+tray-icon = "0.24"
+reqwest = "0.13"
+tar = "0.4"
+flate2 = "1"
+crossbeam-channel = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+zip = "2"
 
 [profile.release]
 opt-level = 2

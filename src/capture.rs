@@ -1,16 +1,22 @@
 //! Screen capture session for the loopback preview endpoint.
 //!
 //! - [`list_displays`] enumerates monitors via `xcap` (no capture started).
-//! - [`CaptureSession`] grabs full-monitor RGBA frames on a worker thread at
-//!   the requested fps, downscales to the requested size, and caches the
-//!   latest frame for [`CaptureSession::latest_jpeg`].
+//! - [`list_windows`] enumerates app windows via `xcap` (no capture started).
+//! - [`CaptureSession`] grabs RGBA frames from one monitor *or* one window on
+//!   a worker thread at the requested fps, downscales to the requested size,
+//!   and caches the latest frame for [`CaptureSession::latest_jpeg`].
+//! - [`snapshot_display`] / [`snapshot_window`] grab exactly one frame,
+//!   downscale it to the requested width (aspect kept, never upscaled), and
+//!   return it as JPEG. Stateless: they never touch [`CaptureSession`].
 //! - JPEG encoding uses the `image` crate's pure-Rust encoder (already pulled
 //!   in transitively by `xcap`; no system libs, no new native deps).
 //!
 //! Threading: one `std::thread` per running session; `stop()` signals it and
 //! joins. A display that disconnects mid-session records an error string and
 //! ends the worker loop — it never panics, and the last good frame stays
-//! available for the preview endpoint.
+//! available for the preview endpoint. A window that closes mid-session ends
+//! the worker loop and drops the cached frame, so the preview 404s instead
+//! of serving a stale window.
 //!
 //! Wiring (done by the parent, not here): store one session in shared state,
 //! e.g. `capture: Arc<Mutex<Option<CaptureSession>>>`, and serve
@@ -40,9 +46,24 @@ const FPS_EMA_ALPHA: f64 = 0.2;
 /// Default JPEG quality when the caller passes `0`.
 const DEFAULT_JPEG_QUALITY: u8 = 80;
 
+/// Default one-shot snapshot width in px (`GET /capture/snapshot`).
+pub const SNAPSHOT_DEFAULT_WIDTH: u32 = 960;
+/// Bounds for the requested snapshot width. `snapshot_*` clamp into this range.
+pub const SNAPSHOT_MIN_WIDTH: u32 = 160;
+/// Bounds for the requested snapshot width. `snapshot_*` clamp into this range.
+pub const SNAPSHOT_MAX_WIDTH: u32 = 1920;
 /// One monitor, as reported by the OS.
 #[derive(Clone, Debug, Serialize)]
 pub struct Display {
+    pub id: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One app window, as reported by the OS.
+#[derive(Clone, Debug, Serialize)]
+pub struct Window {
     pub id: u32,
     pub name: String,
     pub width: u32,
@@ -78,6 +99,7 @@ pub struct CaptureSession {
     last_error: Arc<Mutex<Option<String>>>,
     ema_interval_secs: Arc<Mutex<f64>>,
     display_id: Option<u32>,
+    window_id: Option<u32>,
     width: u32,
     height: u32,
     fps: u32,
@@ -90,6 +112,7 @@ impl std::fmt::Debug for CaptureSession {
         f.debug_struct("CaptureSession")
             .field("running", &self.is_running())
             .field("display_id", &self.display_id)
+            .field("window_id", &self.window_id)
             .field("width", &self.width)
             .field("height", &self.height)
             .field("fps", &self.fps)
@@ -121,8 +144,118 @@ pub fn list_displays() -> anyhow::Result<Vec<Display>> {
     Ok(out)
 }
 
+/// Enumerate the app windows currently visible to the OS.
+///
+/// Skips minimized and zero-area entries: they can never yield frames, so
+/// listing them would offer targets that start and immediately end. Unlike
+/// [`list_displays`], one unreadable window never fails the whole list —
+/// windows come and go at any moment, so entries missing an id or
+/// dimensions are skipped instead of erroring.
+pub fn list_windows() -> anyhow::Result<Vec<Window>> {
+    let windows = xcap::Window::all().context("failed to enumerate windows")?;
+    let mut out = Vec::with_capacity(windows.len());
+    for w in &windows {
+        let Ok(id) = w.id() else { continue };
+        let Ok((width, height)) = window_dimensions(w) else {
+            continue;
+        };
+        if width == 0 || height == 0 {
+            continue;
+        }
+        if w.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        // Prefer the window title; fall back to the app name, then to a
+        // synthetic label so callers always have something to show.
+        let title = w.title().unwrap_or_default();
+        let name = if title.trim().is_empty() {
+            match w.app_name() {
+                Ok(app) if !app.trim().is_empty() => app,
+                _ => format!("Window {id}"),
+            }
+        } else {
+            title
+        };
+        out.push(Window {
+            id,
+            name,
+            width,
+            height,
+        });
+    }
+    Ok(out)
+}
+
+/// Clamp a requested snapshot width into
+/// `SNAPSHOT_MIN_WIDTH..=SNAPSHOT_MAX_WIDTH`.
+pub fn clamp_snapshot_width(width: u32) -> u32 {
+    width.clamp(SNAPSHOT_MIN_WIDTH, SNAPSHOT_MAX_WIDTH)
+}
+
+/// Output dimensions for a one-shot snapshot: `target_width` px wide (clamped)
+/// keeping the aspect ratio, never upscaled (a narrower source keeps its
+/// native size), height at least 1.
+pub fn snapshot_output_size(src_width: u32, src_height: u32, target_width: u32) -> (u32, u32) {
+    let target = clamp_snapshot_width(target_width);
+    if src_width <= target || src_width == 0 || src_height == 0 {
+        return (src_width, src_height);
+    }
+    let height = ((u64::from(src_height) * u64::from(target)) / u64::from(src_width)).max(1) as u32;
+    (target, height)
+}
+
+/// Grab exactly one frame from `display_id` and return it as JPEG.
+///
+/// Downscales to `target_width` px keeping the aspect ratio (see
+/// [`snapshot_output_size`]). An unknown id is an error, as is any grab
+/// failure — the caller maps unknown ids to 400 and failures to 503.
+/// Stateless: never touches [`CaptureSession`] (a running session keeps
+/// grabbing undisturbed).
+pub fn snapshot_display(display_id: u32, target_width: u32) -> anyhow::Result<Vec<u8>> {
+    let monitor = xcap::Monitor::all()
+        .context("failed to enumerate displays")?
+        .into_iter()
+        .find(|m| m.id().unwrap_or(u32::MAX) == display_id);
+    let monitor = monitor.ok_or_else(|| anyhow::anyhow!("display {display_id} not found"))?;
+    let img = monitor
+        .capture_image()
+        .map_err(|e| anyhow::anyhow!("capture failed (display {display_id}): {e}"))?;
+    snapshot_jpeg(img, target_width)
+}
+
+/// Grab exactly one frame from `window_id` and return it as JPEG.
+///
+/// Same contract as [`snapshot_display`], against the window instead of a
+/// monitor. A window closed between listing and here is a capture error
+/// (503), not a panic.
+pub fn snapshot_window(window_id: u32, target_width: u32) -> anyhow::Result<Vec<u8>> {
+    let window = xcap::Window::all()
+        .context("failed to enumerate windows")?
+        .into_iter()
+        .find(|w| w.id().unwrap_or(u32::MAX) == window_id);
+    let window = window.ok_or_else(|| anyhow::anyhow!("window {window_id} not found"))?;
+    let img = window
+        .capture_image()
+        .map_err(|e| anyhow::anyhow!("capture failed (window {window_id}): {e}"))?;
+    snapshot_jpeg(img, target_width)
+}
+
+/// Downscale `img` per [`snapshot_output_size`] and encode it as JPEG at the
+/// default quality (same encoder and filter as the session worker).
+fn snapshot_jpeg(img: image::RgbaImage, target_width: u32) -> anyhow::Result<Vec<u8>> {
+    let (src_w, src_h) = (img.width(), img.height());
+    let (out_w, out_h) = snapshot_output_size(src_w, src_h, target_width);
+    let rgba = if (out_w, out_h) == (src_w, src_h) {
+        img.into_raw()
+    } else {
+        image::imageops::resize(&img, out_w, out_h, image::imageops::FilterType::Triangle).into_raw()
+    };
+    encode_jpeg_rgba(&rgba, out_w, out_h, DEFAULT_JPEG_QUALITY)
+}
+
 impl CaptureSession {
-    /// Idle session; call [`CaptureSession::start`] to begin grabbing.
+    /// Idle session; call [`CaptureSession::start`] (monitor) or
+    /// [`CaptureSession::start_window`] (app window) to begin grabbing.
     pub fn new() -> Self {
         Self {
             worker: None,
@@ -131,6 +264,7 @@ impl CaptureSession {
             last_error: Arc::new(Mutex::new(None)),
             ema_interval_secs: Arc::new(Mutex::new(0.0)),
             display_id: None,
+            window_id: None,
             width: 0,
             height: 0,
             fps: 0,
@@ -143,8 +277,6 @@ impl CaptureSession {
     /// - `width`/`height` must be non-zero and fit inside the display;
     ///   anything larger is rejected (no upscaling).
     /// - Unknown `display_id` (e.g. unplugged since [`list_displays`]) is an
-    ///   error, not a panic. Failed validation leaves a running session
-    ///   untouched.
     pub fn start(
         &mut self,
         display_id: u32,
@@ -152,7 +284,6 @@ impl CaptureSession {
         height: u32,
         fps: u32,
     ) -> anyhow::Result<()> {
-        let fps = clamp_fps(fps);
         validate_size(width, height)?;
 
         let monitor = xcap::Monitor::all()
@@ -168,6 +299,50 @@ impl CaptureSession {
         }
 
         // Validation passed: safe to replace any running session.
+        self.launch(CaptureTarget::Display(display_id), width, height, fps)
+    }
+
+    /// Begin (or restart) grabbing `window_id` at `width`x`height` @ `fps`.
+    ///
+    /// Same contract as [`CaptureSession::start`], against the window's
+    /// dimensions instead of a monitor's. A window closed between
+    /// [`list_windows`] and here is an error, not a panic. Failed validation
+    /// leaves a running session untouched.
+    pub fn start_window(
+        &mut self,
+        window_id: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> anyhow::Result<()> {
+        validate_size(width, height)?;
+
+        let window = xcap::Window::all()
+            .context("failed to enumerate windows")?
+            .into_iter()
+            .find(|w| w.id().unwrap_or(u32::MAX) == window_id);
+        let window = window.ok_or_else(|| anyhow::anyhow!("window {window_id} not found"))?;
+        let (win_w, win_h) = window_dimensions(&window)?;
+        if width > win_w || height > win_h {
+            anyhow::bail!(
+                "requested {width}x{height} exceeds window {window_id} size {win_w}x{win_h}"
+            );
+        }
+
+        // Validation passed: safe to replace any running session.
+        self.launch(CaptureTarget::Window(window_id), width, height, fps)
+    }
+
+    /// Shared launcher: both targets validated above, so this clamps the
+    /// rate, clears stale state, and spawns the worker.
+    fn launch(
+        &mut self,
+        target: CaptureTarget,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> anyhow::Result<()> {
+        let fps = clamp_fps(fps);
         self.shutdown();
 
         self.stop_flag.store(false, Ordering::SeqCst);
@@ -181,15 +356,16 @@ impl CaptureSession {
         let ema_interval_secs = Arc::clone(&self.ema_interval_secs);
         let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
 
-        // NOTE: the monitor is re-resolved inside the worker (by id) so the
+        // NOTE: the target is re-resolved inside the worker (by id) so the
         // spawned closure only carries plain data + Arcs and never requires
-        // `xcap::Monitor: Send`. A display unplugged between validation and
-        // thread start records an error and exits instead of panicking.
+        // `xcap::Monitor` / `xcap::Window: Send`. A target gone between
+        // validation and thread start records an error and exits instead of
+        // panicking.
         let handle = std::thread::Builder::new()
             .name("jlocal-capture".into())
             .spawn(move || {
                 grab_loop(
-                    display_id,
+                    target,
                     width,
                     height,
                     interval,
@@ -202,7 +378,16 @@ impl CaptureSession {
             .context("failed to spawn capture thread")?;
 
         self.worker = Some(handle);
-        self.display_id = Some(display_id);
+        match target {
+            CaptureTarget::Display(id) => {
+                self.display_id = Some(id);
+                self.window_id = None;
+            }
+            CaptureTarget::Window(id) => {
+                self.window_id = Some(id);
+                self.display_id = None;
+            }
+        }
         self.width = width;
         self.height = height;
         self.fps = fps;
@@ -240,7 +425,8 @@ impl CaptureSession {
         }
     }
 
-    /// Last grab failure, if any (e.g. display disconnected mid-session).
+    /// Last grab failure, if any (e.g. display disconnected or window closed
+    /// mid-session).
     pub fn last_error(&self) -> Option<String> {
         lock(&self.last_error).clone()
     }
@@ -249,6 +435,9 @@ impl CaptureSession {
         self.display_id
     }
 
+    pub fn window_id(&self) -> Option<u32> {
+        self.window_id
+    }
     /// Requested (clamped) capture rate; `0` while never started.
     pub fn fps(&self) -> u32 {
         self.fps
@@ -274,13 +463,22 @@ impl Drop for CaptureSession {
     }
 }
 
-/// Worker body: resolve the display, then grab at `interval`, downscale to
+/// What the worker grabs: one monitor or one app window, by OS id.
+#[derive(Clone, Copy, Debug)]
+enum CaptureTarget {
+    Display(u32),
+    Window(u32),
+}
+
+/// Worker body: resolve the target, then grab at `interval`, downscale to
 /// the requested size, and cache the latest frame. Ends when `stop_flag` is
-/// set or the error budget is exhausted (disconnected display). Records
-/// errors instead of panicking.
+/// set or the error budget is exhausted (disconnected display, closed
+/// window). Records errors instead of panicking. A closed window also drops
+/// the cached frame, so the preview 404s rather than serving a stale
+/// window; a disconnected display keeps its last good frame.
 #[allow(clippy::too_many_arguments)]
 fn grab_loop(
-    display_id: u32,
+    target: CaptureTarget,
     width: u32,
     height: u32,
     interval: Duration,
@@ -289,18 +487,37 @@ fn grab_loop(
     last_error: &Mutex<Option<String>>,
     ema_interval_secs: &Mutex<f64>,
 ) {
-    let monitor = match xcap::Monitor::all()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|m| m.id().unwrap_or(u32::MAX) == display_id)
-    {
-        Some(m) => m,
-        None => {
-            *lock(last_error) = Some(format!(
-                "display {display_id} not found (disconnected before capture started)"
-            ));
-            return;
-        }
+    enum Source {
+        Display(xcap::Monitor),
+        Window(xcap::Window),
+    }
+    let source = match target {
+        CaptureTarget::Display(display_id) => match xcap::Monitor::all()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| m.id().unwrap_or(u32::MAX) == display_id)
+        {
+            Some(m) => Source::Display(m),
+            None => {
+                *lock(last_error) = Some(format!(
+                    "display {display_id} not found (disconnected before capture started)"
+                ));
+                return;
+            }
+        },
+        CaptureTarget::Window(window_id) => match xcap::Window::all()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|w| w.id().unwrap_or(u32::MAX) == window_id)
+        {
+            Some(w) => Source::Window(w),
+            None => {
+                *lock(last_error) = Some(format!(
+                    "window {window_id} not found (closed before capture started)"
+                ));
+                return;
+            }
+        },
     };
 
     let mut ema: Option<f64> = None;
@@ -324,7 +541,11 @@ fn grab_loop(
         }
         last_tick = tick;
 
-        match monitor.capture_image() {
+        let grabbed = match &source {
+            Source::Display(m) => m.capture_image(),
+            Source::Window(w) => w.capture_image(),
+        };
+        match grabbed {
             Ok(img) => {
                 consecutive_errors = 0;
                 let rgba = if img.width() == width && img.height() == height {
@@ -347,10 +568,18 @@ fn grab_loop(
             }
             Err(e) => {
                 consecutive_errors += 1;
-                *lock(last_error) = Some(format!(
-                    "capture failed (display {display_id} may be disconnected): {e}"
-                ));
+                *lock(last_error) = Some(match target {
+                    CaptureTarget::Display(display_id) => {
+                        format!("capture failed (display {display_id} may be disconnected): {e}")
+                    }
+                    CaptureTarget::Window(window_id) => {
+                        format!("capture failed (window {window_id} may be closed): {e}")
+                    }
+                });
                 if consecutive_errors > MAX_CONSECUTIVE_ERRORS {
+                    if matches!(target, CaptureTarget::Window(_)) {
+                        *lock(frame) = SharedFrame::empty();
+                    }
                     break;
                 }
             }
@@ -368,8 +597,9 @@ fn clamp_fps(fps: u32) -> u32 {
     fps.clamp(MIN_FPS, MAX_FPS)
 }
 
-/// Reject empty requests up front (oversize-vs-display is checked in
-/// `start()`, which knows the display's dimensions).
+/// Reject empty requests up front (oversize-vs-target is checked in
+/// [`CaptureSession::start`] / [`CaptureSession::start_window`], which know
+/// the target's dimensions).
 fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
     if width == 0 || height == 0 {
         anyhow::bail!("capture size must be non-zero, got {width}x{height}");
@@ -380,6 +610,12 @@ fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
 fn dimension_of(monitor: &xcap::Monitor) -> anyhow::Result<(u32, u32)> {
     let w = monitor.width().context("display is missing its width")?;
     let h = monitor.height().context("display is missing its height")?;
+    Ok((w, h))
+}
+
+fn window_dimensions(window: &xcap::Window) -> anyhow::Result<(u32, u32)> {
+    let w = window.width().context("window is missing its width")?;
+    let h = window.height().context("window is missing its height")?;
     Ok((w, h))
 }
 
@@ -498,11 +734,81 @@ mod tests {
     }
 
     #[test]
+    fn window_start_rejects_zero_size_before_touching_os() {
+        let mut session = CaptureSession::new();
+        // Zero size is rejected before any window is touched (headless-safe),
+        // and a failed start never leaves a worker behind.
+        assert!(session.start_window(0, 0, 1080, 30).is_err());
+        assert!(session.start_window(0, 1920, 0, 30).is_err());
+        assert!(!session.is_running());
+        assert!(session.window_id().is_none());
+    }
+
+    #[test]
+    fn listed_windows_can_all_yield_frames() {
+        // Enumeration is machine-dependent (permissions, headless CI), so a
+        // bare machine may answer Err or an empty list. Whatever comes back
+        // must already be filtered: no zero-area entries, which could never
+        // produce a frame.
+        if let Ok(windows) = list_windows() {
+            assert!(windows.iter().all(|w| w.width > 0 && w.height > 0));
+        }
+    }
+
+    #[test]
     fn invalid_start_options_fail_without_display() {
         let mut session = CaptureSession::new();
         // Zero size is rejected before any display is touched (headless-safe).
         assert!(session.start(0, 0, 1080, 30).is_err());
         assert!(session.start(0, 1920, 0, 30).is_err());
         assert!(!session.is_running());
+    }
+
+    #[test]
+    fn snapshot_width_clamps_to_supported_range() {
+        assert_eq!(clamp_snapshot_width(0), SNAPSHOT_MIN_WIDTH);
+        assert_eq!(clamp_snapshot_width(159), SNAPSHOT_MIN_WIDTH);
+        assert_eq!(clamp_snapshot_width(160), 160);
+        assert_eq!(clamp_snapshot_width(960), 960);
+        assert_eq!(clamp_snapshot_width(1920), SNAPSHOT_MAX_WIDTH);
+        assert_eq!(clamp_snapshot_width(3840), SNAPSHOT_MAX_WIDTH);
+        assert_eq!(clamp_snapshot_width(u32::MAX), SNAPSHOT_MAX_WIDTH);
+    }
+
+    #[test]
+    fn snapshot_output_size_keeps_aspect_and_never_upscales() {
+        // 1920x1080 down to 960 wide halves the height (16:9 kept).
+        assert_eq!(snapshot_output_size(1920, 1080, 960), (960, 540));
+        // Clamp applies before scaling: 3840 wide at 5000 requested → 1920.
+        assert_eq!(snapshot_output_size(3840, 2160, 5000), (1920, 1080));
+        // Narrower than the target: native size, never upscaled.
+        assert_eq!(snapshot_output_size(800, 600, 960), (800, 600));
+        assert_eq!(snapshot_output_size(960, 540, 960), (960, 540));
+        // Odd heights truncate (integer math), never to zero.
+        assert_eq!(snapshot_output_size(1920, 1080, 161), (161, 90));
+        assert_eq!(snapshot_output_size(3000, 1, 160), (160, 1));
+    }
+
+    #[test]
+    fn snapshot_downscale_encodes_real_jpeg_at_scaled_size() {
+        // 320x160 gradient down to 160 wide must come back a real JPEG whose
+        // decoded size matches the aspect-kept output (160x80).
+        let (w, h) = (320, 160);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x / 2) as u8, (y * 3 / 2) as u8, 128, 255]);
+            }
+        }
+        let img: image::RgbaImage =
+            image::ImageBuffer::from_raw(w, h, rgba).expect("test frame must build");
+        let jpeg = snapshot_jpeg(img, 16).expect("downscale+encode must succeed");
+        assert!(
+            jpeg.len() > 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 && jpeg[2] == 0xFF,
+            "missing JPEG SOI magic"
+        );
+        assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "missing JPEG EOI");
+        let decoded = image::load_from_memory(&jpeg).expect("snapshot must decode");
+        assert_eq!((decoded.width(), decoded.height()), (160, 80));
     }
 }

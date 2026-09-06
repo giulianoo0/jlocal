@@ -29,6 +29,8 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    // Leftover from a Windows self-update swap; harmless everywhere else.
+    jlocal::update::cleanup_backup();
     let mut state = status::AppState::new();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
 
@@ -64,13 +66,15 @@ fn main() -> anyhow::Result<()> {
     };
 
     println!(
-        "jlocal {} — status: connected (http://127.0.0.1:{})",
-        status::VERSION,
-        args.port
+        "{}",
+        status::window_title(args.port, state.update.lock().latest_tag.clone().as_deref())
     );
     rt.spawn(api::serve(listener, state.clone()));
 
     if args.no_ui {
+        // Headless still polls for updates (state only: no window or tray
+        // to refresh), so the next UI boot picks the pending tag up.
+        rt.spawn(jlocal::update::run_poller(state.clone(), || {}));
         rt.block_on(async {
             let _ = tokio::signal::ctrl_c().await;
         });
