@@ -66,7 +66,7 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> anyhow
     Ok(())
 }
 
-async fn health(State(s): State<ApiState>) -> impl IntoResponse {
+async fn health(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     let body = Health {
         name: crate::status::NAME,
         version: crate::status::VERSION,
@@ -76,15 +76,19 @@ async fn health(State(s): State<ApiState>) -> impl IntoResponse {
         port: s.port,
         started_unix: s.state.started_unix,
     };
-    with_api_headers(Json(body).into_response())
+    let mut res = Json(body).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
 }
 
-async fn version() -> impl IntoResponse {
+async fn version(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     let body = Version {
         name: crate::status::NAME,
         version: crate::status::VERSION,
     };
-    with_api_headers(Json(body).into_response())
+    let mut res = Json(body).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
 }
 
 async fn preflight(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
@@ -168,13 +172,6 @@ fn apply_cors(state: &AppState, req_headers: &HeaderMap, res_headers: &mut Heade
     );
 }
 
-fn with_api_headers(mut res: Response) -> Response {
-    res.headers_mut().insert(
-        "access-control-allow-private-network",
-        HeaderValue::from_static("true"),
-    );
-    with_no_store(res)
-}
 
 fn with_no_store(mut res: Response) -> Response {
     res.headers_mut().insert(
@@ -196,7 +193,7 @@ mod tests {
             connected: true,
             moq: "disabled",
             torrent: "standby",
-            port: 4173,
+            port: 40392,
             started_unix: 0,
         };
         let v = serde_json::to_value(&h).unwrap();
@@ -206,8 +203,60 @@ mod tests {
     }
 
     #[test]
+    fn default_origins_cover_prod_and_beta() {
+        let origins = super::super::status::default_origins_for_tests();
+        assert!(origins.contains(&"https://beta.juntos.lol".to_string()));
+        assert!(origins.contains(&"https://juntos.lol".to_string()));
+    }
+
+    fn state_with(origins: &[&str]) -> ApiState {
+        ApiState {
+            state: AppState {
+                started_unix: 0,
+                allowed_origins: origins.iter().map(|s| s.to_string()).collect(),
+            },
+            port: 40392,
+        }
+    }
+
+    fn origin_headers(origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_str(origin).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn health_echoes_allowed_origin() {
+        let res = health(State(state_with(&["https://beta.juntos.lol"])), origin_headers("https://beta.juntos.lol"))
+            .await
+            .into_response();
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
+        );
+        assert!(res
+            .headers()
+            .contains_key("access-control-allow-private-network"));
+    }
+
+    #[tokio::test]
+    async fn health_omits_unknown_origin() {
+        let res = health(State(state_with(&["https://beta.juntos.lol"])), origin_headers("https://evil.test"))
+            .await
+            .into_response();
+        assert!(!res
+            .headers()
+            .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    #[test]
     fn loopback_host_check() {
-        for good in ["127.0.0.1:4173", "localhost:4173", "[::1]:4173"] {
+        for good in ["127.0.0.1:40392", "localhost:40392", "[::1]:40392"] {
             let g = good.to_ascii_lowercase();
             assert!(
                 g.starts_with("127.0.0.1") || g.starts_with("localhost") || g.starts_with("[::1]")

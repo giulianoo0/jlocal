@@ -16,11 +16,11 @@ in the juntos.lol web UI, which talks to this app over loopback.
 ## Quickstart
 
 ```sh
-cargo run -- --port 4173
-# jlocal v0.1.0 — status: connected (http://127.0.0.1:4173)
+ cargo run -- --port 40392
+ # jlocal v0.1.0 — status: connected (http://127.0.0.1:40392)
 
-curl http://127.0.0.1:4173/health
-# {"name":"jlocal","version":"v0.1.0","connected":true,"moq":"disabled","torrent":"standby","port":4173}
+ curl http://127.0.0.1:40392/health
+ # {"name":"jlocal","version":"v0.1.0","connected":true,"moq":"disabled","torrent":"standby","port":40392}
 
 jlocal --version        # jlocal v0.1.0
 jlocal --no-ui          # headless: API only (tray-less servers, CI)
@@ -34,12 +34,14 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `GET /version`| `{name, version}`                                                |
 | `GET /events` | SSE: `hello` + 15s heartbeats.                                   |
 
-Security: `Host` must be loopback (DNS-rebinding guard); CORS echoes only
-`JLOCAL_ALLOWED_ORIGINS`; `Access-Control-Allow-Private-Network: true`;
+Security: `Host` must be loopback (DNS-rebinding guard); CORS echoes
+allowlisted origins (`Access-Control-Allow-Origin` + Vary) on every endpoint
+including `GET /health`; `Access-Control-Allow-Private-Network: true`;
 `Cache-Control: no-store`. Browsers should `fetch` (not `EventSource`).
 
-Env: `JLOCAL_PORT` (default `4173`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
-(comma-separated `https://` origins), `JLOCAL_VERSION` (injected by release CI).
+Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
+(comma-separated `https://` origins, replaces the juntos.lol + beta defaults),
+`JLOCAL_VERSION` (injected by release CI).
 
 ## Install (per OS)
 
