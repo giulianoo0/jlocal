@@ -98,7 +98,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum -- * > sha256sums.txt || shasum -a 256 -- * > sha256sums.txt
+          sha256sum -- *.tar.gz *.zip *.dmg > sha256sums.txt || shasum -a 256 -- *.tar.gz *.zip *.dmg > sha256sums.txt
           cat sha256sums.txt
 
       - name: GitHub Release
@@ -107,5 +107,5 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" --title "jlocal $TAG" \
-            --notes "jlocal $TAG — local companion skeleton: loopback API (/health, /version, /events) + status/version window. See README for install steps per OS." \
-            dist/*
+            --notes "jlocal $TAG — local companion: live torrent engine, native capture/audio inventory, loopback API on 127.0.0.1:40392. See README for install steps per OS." \
+            dist/*.tar.gz dist/*.zip dist/*.dmg dist/sha256sums.txt
