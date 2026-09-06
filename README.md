@@ -39,7 +39,7 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `POST /audio/mode`  | `{mode}` persists `all`/`none`/`custom` (mute set preserved)     |
 | `POST /audio/mute`  | `{app, muted}` persists one app toggle                           |
 | `GET /capture/displays` | `{displays:[{id,name,width,height}]}` from the OS           |
-| `GET /capture/windows` | `{windows:[{id,name,width,height}]}` from the OS (minimized/zero-area skipped) |
+| `GET /capture/windows` | `{windows:[{id,name,app,icon,width,height}]}` from the OS (minimized/zero-area skipped; `icon` is the owning app's icon as a `data:image/png;base64,…` URL at 32px, `""` when unavailable — macOS + Windows only, Linux always `""`) |
 | `GET /capture/preview.jpg` | Latest frame JPEG, `404 {error:"idle"}` when stopped     |
 | `GET /capture/snapshot` | One-frame JPEG for picker previews: `?display_id=<id\|empty=primary>` xor `?window_id=<id>`, `&width=<px>` (default 960, clamp 160–1920, aspect kept); `200 image/jpeg`; `400` both/neither/garbage/unknown id; `503 {error:"permission"\|"unavailable"}` (stateless — never touches the running session) |
 | `POST /capture/start` | `{display_id _xor_ window_id,width,height,fps}` → `{started,display_id\|window_id,width,height,fps}` (exactly one id; unknown id is `400`; a window closed mid-session ends frames so preview `404`s; preview only — publish unwired, see below) |

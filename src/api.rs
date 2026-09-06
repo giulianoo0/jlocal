@@ -1292,6 +1292,7 @@ mod tests {
                 id: 3,
                 name: "a".into(),
                 app: "A".into(),
+                icon: String::new(),
                 width: 800,
                 height: 600,
             },
@@ -1299,6 +1300,7 @@ mod tests {
                 id: 5,
                 name: "b".into(),
                 app: "B".into(),
+                icon: "data:image/png;base64,iVBORw0KGgo=".into(),
                 width: 1024,
                 height: 768,
             },
@@ -1307,6 +1309,46 @@ mod tests {
         assert!(super::select_window(&windows, 9).is_none());
         let empty: Vec<Window> = vec![];
         assert!(super::select_window(&empty, 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_windows_reports_icon_per_entry() {
+        // Live enumeration is machine-dependent (headless CI may 500 when
+        // the OS refuses); either way CORS + no-store hold, and every
+        // listed window carries a string `icon` — "" or a PNG data URL.
+        let res = capture_windows(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        if res.status() != StatusCode::OK {
+            return;
+        }
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let windows = v["windows"].as_array().expect("windows must be an array");
+        for w in windows {
+            let icon = w["icon"].as_str().expect("window must carry a string icon");
+            assert!(
+                icon.is_empty() || icon.starts_with("data:image/png;base64,"),
+                "unexpected icon shape"
+            );
+        }
     }
 
     #[tokio::test]

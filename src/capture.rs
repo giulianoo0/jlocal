@@ -52,6 +52,10 @@ pub const SNAPSHOT_DEFAULT_WIDTH: u32 = 960;
 pub const SNAPSHOT_MIN_WIDTH: u32 = 160;
 /// Bounds for the requested snapshot width. `snapshot_*` clamp into this range.
 pub const SNAPSHOT_MAX_WIDTH: u32 = 1920;
+/// Icon edge in px for [`Window::icon`]: icons are downscaled to fit this
+/// box (aspect kept, never upscaled), so a data URL stays ~1–4 KiB and the
+/// whole `/capture/windows` payload stays small. Never larger than 64.
+pub const ICON_SIZE: u32 = 32;
 /// One monitor, as reported by the OS.
 #[derive(Clone, Debug, Serialize)]
 pub struct Display {
@@ -62,12 +66,15 @@ pub struct Display {
 }
 
 /// One app window, as reported by the OS. `app` is the owning application
-/// (empty when the OS would not say); `name` stays the human label.
+/// (empty when the OS would not say); `name` stays the human label. `icon`
+/// is the owning app's icon as a `data:image/png;base64,…` URL at
+/// [`ICON_SIZE`] px ("" when the OS has no icon to give — Linux always).
 #[derive(Clone, Debug, Serialize)]
 pub struct Window {
     pub id: u32,
     pub name: String,
     pub app: String,
+    pub icon: String,
     pub width: u32,
     pub height: u32,
 }
@@ -152,7 +159,12 @@ pub fn list_displays() -> anyhow::Result<Vec<Display>> {
 /// listing them would offer targets that start and immediately end. Unlike
 /// [`list_displays`], one unreadable window never fails the whole list —
 /// windows come and go at any moment, so entries missing an id or
-/// dimensions are skipped instead of erroring.
+/// dimensions are skipped instead of erroring. A window whose icon cannot
+/// be read keeps `icon: ""` — one bad icon never drops the window.
+///
+/// Cost: icons resolve lazily on every call (one OS lookup per window —
+/// `NSRunningApplication` on macOS, exe icon on Windows). Lists are small
+/// (tens of windows), so this stays in the noise next to enumeration.
 pub fn list_windows() -> anyhow::Result<Vec<Window>> {
     let windows = xcap::Window::all().context("failed to enumerate windows")?;
     let mut out = Vec::with_capacity(windows.len());
@@ -185,11 +197,278 @@ pub fn list_windows() -> anyhow::Result<Vec<Window>> {
             id,
             name,
             app,
+            // Best-effort per window: unknown pid or unreadable icon → "".
+            icon: w
+                .pid()
+                .ok()
+                .and_then(window_icon_for_pid)
+                .unwrap_or_default(),
             width,
             height,
         });
     }
     Ok(out)
+}
+
+/// Owning-app icon for `pid` as a PNG data URL, or `None` when the OS has
+/// nothing to give. Per-window best-effort — see [`list_windows`]: every
+/// step is optional (apps come and go; daemons and bare CLI tools have no
+/// GUI icon), so failures degrade to `None`, never to an error.
+#[cfg(target_os = "macos")]
+fn window_icon_for_pid(pid: u32) -> Option<String> {
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSRunningApplication};
+    use objc2_foundation::{NSCopying, NSDictionary};
+
+    // pid → running app → icon.
+    let app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)?;
+    let icon = app.icon()?;
+    // App icons ship reps up to 2048px as 16-bit-float TIFFs (tens of MB,
+    // undecodable outside AppKit). Work on a copy with the giants stripped:
+    // the remaining ≤256px TIFF stays a few MB and parses fast.
+    let small = icon.copy();
+    for rep in icon.representations().to_vec() {
+        if rep.pixelsWide() > 256 || rep.pixelsHigh() > 256 {
+            small.removeRepresentation(&rep);
+        }
+    }
+    let tiff = small.TIFFRepresentation()?;
+    // AppKit parses its own float TIFFs; ask the bitmap back as PNG (the
+    // empty properties dict's generics infer from the call below).
+    let bitmap = NSBitmapImageRep::imageRepWithData(&tiff)?;
+    let props = NSDictionary::new();
+    // SAFETY: empty properties are trivially well-typed; a nil return
+    // becomes `None` via the `?` below.
+    let png =
+        unsafe { bitmap.representationUsingType_properties(NSBitmapImageFileType::PNG, &props) }?;
+    let bytes = png.to_vec();
+    if bytes.is_empty() {
+        return None;
+    }
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some(icon_data_url(img))
+}
+
+/// Owning-app icon for `pid` as a PNG data URL, or `None`.
+/// pid → exe path → large (32px) shell icon → RGBA → shared tail below.
+///
+/// Compiled on Windows only (this mac can't check it — CI's windows-latest
+/// runner does), so it stays small and straight-line on purpose: one unsafe
+/// block per Win32 step, `?`/`None` on any failure, GDI objects released.
+#[cfg(target_os = "windows")]
+fn window_icon_for_pid(pid: u32) -> Option<String> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, MAX_PATH};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+    use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+
+    // pid → exe path (nul-terminated for the shell call below).
+    let path = unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = vec![0u16; MAX_PATH as usize];
+        let mut len = buf.len() as u32;
+        let exe = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(process);
+        if !exe {
+            return None;
+        }
+        buf.truncate(len as usize);
+        buf.push(0);
+        buf
+    };
+    // exe path → large shell icon (SHGFI_LARGEICON is the 32px default).
+    let hicon = unsafe {
+        let mut info: SHFILEINFOW = std::mem::zeroed();
+        let found = SHGetFileInfoW(
+            PCWSTR(path.as_ptr()),
+            windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info as *mut SHFILEINFOW),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if found == 0 || info.hIcon.is_invalid() {
+            return None;
+        }
+        info.hIcon
+    };
+    // HICON → RGBA pixels, then the shared tail (downscale + PNG + URL).
+    let img = unsafe { hicon_to_rgba(hicon) }?;
+    unsafe {
+        let _ = DestroyIcon(hicon);
+    }
+    Some(icon_data_url(img))
+}
+
+/// Read an `HICON`'s pixels as RGBA. Prefers the color bitmap's own alpha
+/// (correct for modern icons); legacy icons store no alpha there, so an
+/// all-zero alpha plane falls back to the monochrome mask (white = glass).
+/// Releases the DC and both bitmaps before returning.
+#[cfg(target_os = "windows")]
+unsafe fn hicon_to_rgba(
+    hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> Option<image::RgbaImage> {
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+
+    unsafe {
+        let mut info: ICONINFO = std::mem::zeroed();
+        GetIconInfo(hicon, &mut info).ok()?;
+        let release = DropBitmaps {
+            color: info.hbmColor,
+            mask: info.hbmMask,
+        };
+        let mut bmp: BITMAP = std::mem::zeroed();
+        if GetObjectW(
+            info.hbmColor.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut BITMAP as *mut core::ffi::c_void),
+        ) == 0
+        {
+            return None;
+        }
+        let (w, h) = (bmp.bmWidth.max(1) as u32, bmp.bmHeight.max(1) as u32);
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return None;
+        }
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32), // top-down: rows land in display order
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            hdc,
+            info.hbmColor,
+            0,
+            h,
+            Some(bgra.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        let mut mask = vec![0u8; (w * h * 4) as usize];
+        let mask_lines = GetDIBits(
+            hdc,
+            info.hbmMask,
+            0,
+            h,
+            Some(mask.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(None, hdc);
+        drop(release);
+        if lines == 0 {
+            return None;
+        }
+        // GDI hands back BGRA: swap to RGBA, and where the color bitmap
+        // carries no alpha at all, derive it from the mask instead.
+        let no_alpha = bgra.chunks_exact(4).all(|px| px[3] == 0);
+        let mut rgba = Vec::with_capacity(bgra.len());
+        for (i, px) in bgra.chunks_exact(4).enumerate() {
+            let alpha = if no_alpha && mask_lines > 0 {
+                // Mask converts to 32-bit white (glass) / black (solid).
+                if mask[i * 4] == 0xFF {
+                    0
+                } else {
+                    0xFF
+                }
+            } else {
+                px[3]
+            };
+            rgba.extend_from_slice(&[px[2], px[1], px[0], alpha]);
+        }
+        image::RgbaImage::from_raw(w, h, rgba)
+    }
+}
+
+/// Release the two bitmaps `GetIconInfo` hands out (the caller owns them).
+#[cfg(target_os = "windows")]
+struct DropBitmaps {
+    color: windows::Win32::Graphics::Gdi::HBITMAP,
+    mask: windows::Win32::Graphics::Gdi::HBITMAP,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for DropBitmaps {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(self.color.into());
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(self.mask.into());
+        }
+    }
+}
+
+/// Linux has no icon source in scope (explicitly out), so every window
+/// reports `icon: ""` and the web keeps its letter avatar.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn window_icon_for_pid(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Fit `w`×`h` inside the [`ICON_SIZE`] box keeping the aspect ratio, each
+/// edge at least 1px. Pure integer math: the long edge lands on ICON_SIZE.
+fn icon_thumb_size(w: u32, h: u32) -> (u32, u32) {
+    let m = w.max(h).max(1);
+    ((w * ICON_SIZE / m).max(1), (h * ICON_SIZE / m).max(1))
+}
+
+/// Shared tail for every OS: fit `img` in the [`ICON_SIZE`] box (aspect
+/// kept, never upscaled — small icons pass through untouched), encode a
+/// tight PNG, and wrap it as a data URL. Infallible by construction for
+/// real images: the PNG encoder only fails on OOM, and `from_raw` above
+/// already validated the buffer.
+fn icon_data_url(img: image::RgbaImage) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use image::ImageEncoder;
+
+    let (w, h) = (img.width(), img.height());
+    let small = if w > ICON_SIZE || h > ICON_SIZE {
+        let (tw, th) = icon_thumb_size(w, h);
+        image::imageops::resize(&img, tw, th, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    // `write_image` consumes the encoder and takes the buffer as-is: no
+    // color-type conversion surprises — it is RGBA8 by construction.
+    if enc
+        .write_image(
+            small.as_raw(),
+            small.width(),
+            small.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut url = String::with_capacity(22 + png.len() * 4 / 3 + 4);
+    url.push_str("data:image/png;base64,");
+    STANDARD.encode_string(&png, &mut url);
+    url
 }
 
 /// Clamp a requested snapshot width into
@@ -817,5 +1096,71 @@ mod tests {
         assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "missing JPEG EOI");
         let decoded = image::load_from_memory(&jpeg).expect("snapshot must decode");
         assert_eq!((decoded.width(), decoded.height()), (160, 80));
+    }
+
+    fn solid_rgba(w: u32, h: u32, px: [u8; 4]) -> image::RgbaImage {
+        image::RgbaImage::from_pixel(w, h, image::Rgba(px))
+    }
+
+    fn decode_icon_data_url(url: &str) -> Vec<u8> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let b64 = url
+            .strip_prefix("data:image/png;base64,")
+            .expect("icon must be a PNG data URL");
+        STANDARD.decode(b64).expect("icon base64 must decode")
+    }
+
+    #[test]
+    fn icon_url_is_small_valid_png_at_icon_size() {
+        // 128x128 solid red must come back a real PNG that fits the ICON_SIZE
+        // box — this is the whole /capture/windows payload story per window.
+        let url = icon_data_url(solid_rgba(128, 128, [255, 0, 0, 255]));
+        let png = decode_icon_data_url(&url);
+        assert_eq!(
+            &png[0..8],
+            &[137, 80, 78, 71, 13, 10, 26, 10],
+            "missing PNG magic"
+        );
+        let decoded = image::load_from_memory(&png).expect("icon PNG must decode");
+        assert!(decoded.width() <= ICON_SIZE && decoded.height() <= ICON_SIZE);
+        assert!(decoded.width() <= 64 && decoded.height() <= 64);
+        assert_eq!((decoded.width(), decoded.height()), (32, 32));
+    }
+
+    #[test]
+    fn icon_url_keeps_aspect_and_never_upscales() {
+        // Wide source keeps its ratio inside the box…
+        let wide = icon_data_url(solid_rgba(128, 64, [0, 255, 0, 255]));
+        let decoded = image::load_from_memory(&decode_icon_data_url(&wide)).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (32, 16));
+        // …while a small source passes through at native size.
+        let tiny = icon_data_url(solid_rgba(16, 16, [0, 0, 255, 255]));
+        let decoded = image::load_from_memory(&decode_icon_data_url(&tiny)).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (16, 16));
+    }
+
+    #[test]
+    fn window_serializes_its_icon_for_old_and_new_clients() {
+        // Old web clients ignore unknown keys; new ones read `icon`, so the
+        // field must always be present (possibly "").
+        let w = Window {
+            id: 7,
+            name: "n".into(),
+            app: "a".into(),
+            icon: String::new(),
+            width: 800,
+            height: 600,
+        };
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["icon"], "");
+        let w2 = Window {
+            icon: icon_data_url(solid_rgba(16, 16, [1, 2, 3, 255])),
+            ..w
+        };
+        let v2 = serde_json::to_value(&w2).unwrap();
+        assert!(v2["icon"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
     }
 }
