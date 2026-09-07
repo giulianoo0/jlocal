@@ -22,7 +22,7 @@
 //! e.g. `capture: Arc<Mutex<Option<CaptureSession>>>`, and serve
 //! `GET /capture/preview.jpg` from `latest_jpeg()`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -45,6 +45,12 @@ const FPS_EMA_ALPHA: f64 = 0.2;
 
 /// Default JPEG quality when the caller passes `0`.
 const DEFAULT_JPEG_QUALITY: u8 = 80;
+
+/// Every started capture owns a token. The loopback client returns it to
+/// `/capture/stop`, so a delayed stop from the previous feed cannot tear down
+/// a replacement session (resolution/FPS switches start before the old HTTP
+/// cleanup is guaranteed to arrive).
+static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Default one-shot snapshot width in px (`GET /capture/snapshot`).
 pub const SNAPSHOT_DEFAULT_WIDTH: u32 = 960;
@@ -79,20 +85,20 @@ pub struct Window {
     pub height: u32,
 }
 
-/// Latest cached frame: contiguous RGBA8 bytes at the requested size.
+/// Latest cached frame. JPEG compression happens once on the capture worker,
+/// not once per HTTP client/tick. Keeping only the compressed frame also
+/// avoids pinning a 32 MiB RGBA allocation for a 4K session.
 #[derive(Debug)]
 struct SharedFrame {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+    jpeg: axum::body::Bytes,
+    sequence: u64,
 }
 
 impl SharedFrame {
     fn empty() -> Self {
         Self {
-            rgba: Vec::new(),
-            width: 0,
-            height: 0,
+            jpeg: axum::body::Bytes::new(),
+            sequence: 0,
         }
     }
 }
@@ -112,6 +118,7 @@ pub struct CaptureSession {
     width: u32,
     height: u32,
     fps: u32,
+    id: u64,
 }
 
 // Manually implemented: `JoinHandle` has no `Debug` impl, and derived debug
@@ -125,6 +132,7 @@ impl std::fmt::Debug for CaptureSession {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("fps", &self.fps)
+            .field("id", &self.id)
             .field("actual_fps", &self.actual_fps())
             .finish()
     }
@@ -384,9 +392,10 @@ unsafe fn hicon_to_rgba(
         }
         // GDI hands back BGRA: swap to RGBA, and where the color bitmap
         // carries no alpha at all, derive it from the mask instead.
-        let no_alpha = bgra.chunks_exact(4).all(|px| px[3] == 0);
+        let (pixels, _) = bgra.as_chunks::<4>();
+        let no_alpha = pixels.iter().all(|px| px[3] == 0);
         let mut rgba = Vec::with_capacity(bgra.len());
-        for (i, px) in bgra.chunks_exact(4).enumerate() {
+        for (i, px) in pixels.iter().enumerate() {
             let alpha = if no_alpha && mask_lines > 0 {
                 // Mask converts to 32-bit white (glass) / black (solid).
                 if mask[i * 4] == 0xFF {
@@ -556,6 +565,7 @@ impl CaptureSession {
             width: 0,
             height: 0,
             fps: 0,
+            id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -633,15 +643,14 @@ impl CaptureSession {
         // that may trigger the OS permission prompt — i.e. only on explicit
         // user intent (confirm), never on a preview/snapshot poll.
         let source = resolve_source(target)?;
-        let (rgba, width, height) = grab_sized(&source, target, width, height)?;
+        let jpeg = grab_jpeg(&source, target, width, height)?;
 
         self.stop_flag.store(false, Ordering::SeqCst);
         *lock(&self.last_error) = None;
         *lock(&self.ema_interval_secs) = 0.0;
         *lock(&self.frame) = SharedFrame {
-            rgba,
-            width,
-            height,
+            jpeg: jpeg.into(),
+            sequence: 1,
         };
 
         let stop_flag = Arc::clone(&self.stop_flag);
@@ -688,14 +697,25 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// Encode the latest cached frame as JPEG. Returns `None` while idle or
-    /// before the first frame lands (the preview handler maps this to 404).
-    pub fn latest_jpeg(&self, quality: u8) -> Option<Vec<u8>> {
+    /// Clone the already-compressed latest frame. Returns `None` while idle
+    /// or before the first frame lands (the preview handler maps this to 404).
+    pub fn latest_jpeg(&self) -> Option<axum::body::Bytes> {
         let cached = lock(&self.frame);
-        if cached.rgba.is_empty() {
+        if cached.jpeg.is_empty() {
             return None;
         }
-        encode_jpeg_rgba(&cached.rgba, cached.width, cached.height, quality).ok()
+        Some(cached.jpeg.clone())
+    }
+
+    /// Clone a frame only when it is newer than `after`. The MJPEG endpoint
+    /// uses this to avoid transmitting duplicate frames when capture or JPEG
+    /// compression cannot keep up with the requested ceiling.
+    pub fn latest_jpeg_after(&self, after: u64) -> Option<(u64, axum::body::Bytes)> {
+        let cached = lock(&self.frame);
+        if cached.jpeg.is_empty() || cached.sequence == after {
+            return None;
+        }
+        Some((cached.sequence, cached.jpeg.clone()))
     }
 
     /// Signal the worker to stop and join it. Safe to call while idle.
@@ -735,6 +755,11 @@ impl CaptureSession {
     /// Requested (clamped) capture rate; `0` while never started.
     pub fn fps(&self) -> u32 {
         self.fps
+    }
+
+    /// Stable ownership token for conditional stop and stream isolation.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     fn shutdown(&mut self) {
@@ -823,6 +848,19 @@ fn grab_sized(
     Ok((rgba, width, height))
 }
 
+/// Capture, resize, and compress one frame without holding the shared-frame
+/// mutex. HTTP readers only ever clone the completed JPEG, so encoding can no
+/// longer stall the OS grab loop while a lock is held.
+fn grab_jpeg(
+    source: &Source,
+    target: CaptureTarget,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let (rgba, width, height) = grab_sized(source, target, width, height)?;
+    encode_jpeg_rgba(&rgba, width, height, DEFAULT_JPEG_QUALITY)
+}
+
 /// Worker body: resolve the target, then grab at `interval`, downscale to
 /// the requested size, and cache the latest frame. Ends when `stop_flag` is
 /// set or the error budget is exhausted (disconnected display, closed
@@ -858,35 +896,37 @@ fn grab_loop(
     };
 
     let mut ema: Option<f64> = None;
-    let mut last_tick = Instant::now();
+    let mut last_frame_at: Option<Instant> = None;
     let mut consecutive_errors: u32 = 0;
+    let mut sequence = 1_u64;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
         let tick = Instant::now();
-        if tick > last_tick {
-            let sample = tick.duration_since(last_tick).as_secs_f64();
-            if sample > 0.0 && sample.is_finite() {
-                ema = Some(match ema {
-                    Some(prev) => prev + FPS_EMA_ALPHA * (sample - prev),
-                    None => sample,
-                });
-                *lock(ema_interval_secs) = ema.unwrap_or(0.0);
-            }
-        }
-        last_tick = tick;
 
-        match grab_sized(&source, target, width, height) {
-            Ok((rgba, width, height)) => {
+        match grab_jpeg(&source, target, width, height) {
+            Ok(jpeg) => {
                 consecutive_errors = 0;
+                sequence = sequence.wrapping_add(1).max(1);
                 *lock(frame) = SharedFrame {
-                    rgba,
-                    width,
-                    height,
+                    jpeg: jpeg.into(),
+                    sequence,
                 };
                 *lock(last_error) = None;
+                let now = Instant::now();
+                if let Some(previous) = last_frame_at {
+                    let sample = now.duration_since(previous).as_secs_f64();
+                    if sample > 0.0 && sample.is_finite() {
+                        ema = Some(match ema {
+                            Some(prev) => prev + FPS_EMA_ALPHA * (sample - prev),
+                            None => sample,
+                        });
+                        *lock(ema_interval_secs) = ema.unwrap_or(0.0);
+                    }
+                }
+                last_frame_at = Some(now);
             }
             Err(e) => {
                 consecutive_errors += 1;
@@ -1066,7 +1106,7 @@ mod tests {
         let mut session = CaptureSession::new();
         assert!(!session.is_running());
         assert_eq!(session.actual_fps(), 0.0);
-        assert!(session.latest_jpeg(80).is_none());
+        assert!(session.latest_jpeg().is_none());
         assert!(session.last_error().is_none());
         // Stopping (and dropping) an idle session is a safe no-op.
         session.stop();

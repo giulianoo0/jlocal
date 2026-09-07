@@ -15,7 +15,7 @@
 //!
 //! - Torrent ids are **lowercase infohash hex** (40 chars), stable across
 //!   restarts. This module rejects anything else in [`parse_id_hex`].
-//! - [`TorrentManager::read_range`] takes `Range<u64>` with an **inclusive**
+//! - [`TorrentManager::open_range`] takes `Range<u64>` with an **inclusive**
 //!   `end` (HTTP semantics: `bytes=a-b` maps to `a..b`, `bytes=a-` maps to
 //!   `a..total-1`, `bytes=-n` maps to `total-n..total-1`). The parent parses
 //!   the RFC 9110 `Range` header; unsatisfiable/out-of-range requests surface
@@ -39,7 +39,7 @@ use librqbit::{
 /// spell it: every `Session` API that takes one accepts `&Arc<ManagedTorrent>`.
 type ManagedTorrentHandle = std::sync::Arc<ManagedTorrent>;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncSeekExt};
 
 /// How long `add_magnet` waits for magnet metadata (DHT + trackers) before
 /// giving up. DHT fetches usually resolve in seconds; 60s covers slow swarms
@@ -53,9 +53,9 @@ const SELECT_INIT_WAIT: Duration = Duration::from_secs(30);
 /// giving up. Upstream `Session::delete` panics without resolved metadata, so
 /// we refuse rather than crash.
 const REMOVE_INIT_WAIT: Duration = Duration::from_secs(10);
-/// Upper bound for a single `read_range` call. Ranges must be materialized
-/// into one buffer, so cap them to avoid OOM from adversarial `Range`
-/// headers. Video clients request ~1-8 MiB chunks; 64 MiB is generous.
+/// Upper bound for a single `open_range` call. The response is streamed, but
+/// bounding ranges keeps each request and librqbit's lookahead predictable.
+/// Video clients request ~1-8 MiB chunks; 64 MiB is generous.
 pub const MAX_RANGE_BYTES: u64 = 64 << 20;
 
 /// Suggested default download dir when the caller provides none:
@@ -343,20 +343,20 @@ impl TorrentManager {
             .with_torrents(|torrents| torrents.map(|(_, mgr)| self.describe(mgr)).collect())
     }
 
-    /// Read `range` (`end` **inclusive**) of file `file_idx`.
-    /// Returns `(bytes, file_total)`.
+    /// Open `range` (`end` **inclusive**) of file `file_idx` as a positioned
+    /// stream. Returns `(stream, range_len, file_total)`.
     ///
     /// Reads go through librqbit's streaming engine, which prioritizes the
     /// requested file's 32 MiB lookahead window and pends until the pieces
-    /// arrive -- i.e. reads ahead of the download **block** (like rqbit's own
-    /// `/stream` endpoint) rather than failing. There is no timeout: a stalled
-    /// swarm stalls the read, and the HTTP layer should apply its own deadline.
-    pub async fn read_range(
+    /// arrive. The HTTP layer consumes this incrementally so it can send
+    /// response headers immediately and forward bytes as pieces land instead
+    /// of buffering an entire multi-megabyte range before first byte.
+    pub async fn open_range(
         &self,
         id: &str,
         file_idx: usize,
         range: Range<u64>,
-    ) -> anyhow::Result<(Vec<u8>, u64)> {
+    ) -> anyhow::Result<(impl AsyncRead + Unpin + Send + 'static, u64, u64)> {
         let handle = self.resolve(id)?;
         let total = match handle
             .with_metadata(|m| m.info.iter_file_details().nth(file_idx).map(|d| d.len))
@@ -387,13 +387,7 @@ impl TorrentManager {
             .seek(SeekFrom::Start(start))
             .await
             .context("error seeking torrent stream")?;
-        // len <= MAX_RANGE_BYTES (64 MiB): always fits in memory address space.
-        let mut buf = vec![0u8; len as usize];
-        stream
-            .read_exact(&mut buf)
-            .await
-            .context("error reading torrent data")?;
-        Ok((buf, total))
+        Ok((stream, len, total))
     }
 
     /// Download only `file_idx`, deprioritizing the rest of the torrent.
@@ -401,7 +395,7 @@ impl TorrentManager {
     /// librqbit exposes no explicit "critical window" API; the prioritization
     /// this relies on is (a) `update_only_files`, which stops fetching other
     /// files' pieces entirely, and (b) the streaming engine's 32 MiB lookahead
-    /// around the active [`read_range`][Self::read_range] position, which is
+    /// around the active [`open_range`][Self::open_range] position, which is
     /// what actually pulls the selected file first.
     pub async fn select_file(&self, id: &str, file_idx: usize) -> anyhow::Result<()> {
         let handle = self.resolve(id)?;

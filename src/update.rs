@@ -9,7 +9,9 @@
 //! `jlocal-<tag>-<target>.(tar.gz|zip)`, where `<tag>` is the release tag
 //! (e.g. `v0.2.0`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Where we look for a newer release.

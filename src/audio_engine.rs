@@ -973,15 +973,12 @@ mod tests {
         assert!(tap.drain_frames().is_empty());
         tap.stop(); // safe while idle
         tap.set_excluded(&HashSet::new()); // no-op while idle
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        #[cfg(not(target_os = "macos"))]
         assert!(tap.start(&HashSet::new()).is_err());
     }
 
     #[test]
     fn capture_flag_matches_platform() {
-        assert_eq!(
-            capture_supported(),
-            cfg!(any(target_os = "macos", target_os = "windows"))
-        );
+        assert_eq!(capture_supported(), cfg!(target_os = "macos"));
     }
 }

@@ -27,6 +27,7 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use tokio::io::AsyncReadExt;
 
 use crate::status::AppState;
 
@@ -258,11 +259,20 @@ async fn audio_apps(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoR
 }
 
 async fn capture_displays(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
-    let mut res = match crate::capture::list_displays() {
-        Ok(displays) => Json(serde_json::json!({"displays": displays})).into_response(),
-        Err(e) => (
+    // OS enumeration can synchronously wait on WindowServer/Win32. Keep it
+    // off Tokio's request workers so opening the picker cannot stall health,
+    // audio, or a running MJPEG response.
+    let listed = tokio::task::spawn_blocking(crate::capture::list_displays).await;
+    let mut res = match listed {
+        Ok(Ok(displays)) => Json(serde_json::json!({"displays": displays})).into_response(),
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("display enumeration worker failed: {e}")})),
         )
             .into_response(),
     };
@@ -271,11 +281,19 @@ async fn capture_displays(State(s): State<ApiState>, headers: HeaderMap) -> impl
 }
 
 async fn capture_windows(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
-    let mut res = match crate::capture::list_windows() {
-        Ok(windows) => Json(serde_json::json!({"windows": windows})).into_response(),
-        Err(e) => (
+    // Window enumeration also resolves application icons on macOS/Windows,
+    // which is much too expensive to run on an async request worker.
+    let listed = tokio::task::spawn_blocking(crate::capture::list_windows).await;
+    let mut res = match listed {
+        Ok(Ok(windows)) => Json(serde_json::json!({"windows": windows})).into_response(),
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("window enumeration worker failed: {e}")})),
         )
             .into_response(),
     };
@@ -289,7 +307,7 @@ async fn capture_preview(State(s): State<ApiState>, headers: HeaderMap) -> impl 
         .capture
         .lock()
         .as_ref()
-        .and_then(|active| active.latest_jpeg(80));
+        .and_then(|active| active.latest_jpeg());
     let mut res = match jpeg {
         Some(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
         None => (
@@ -311,8 +329,14 @@ async fn capture_preview(State(s): State<ApiState>, headers: HeaderMap) -> impl 
 /// overlapping in-flight grabs at 60fps and can never look smooth.
 /// CORS + no-store like every capture route.
 async fn capture_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
-    let live_fps = { s.state.capture.lock().as_ref().map(|session| session.fps()) };
-    let Some(fps) = live_fps else {
+    let live = {
+        s.state
+            .capture
+            .lock()
+            .as_ref()
+            .map(|session| (session.id(), session.fps()))
+    };
+    let Some((capture_id, fps)) = live else {
         let mut res = (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "idle"})),
@@ -324,31 +348,43 @@ async fn capture_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl I
     let state = s.state.clone();
     let interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     let stream = async_stream::stream! {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_sequence = 0_u64;
         loop {
-            let frame = {
-                state
-                    .capture
-                    .lock()
-                    .as_ref()
-                    .and_then(|session| session.latest_jpeg(90))
+            ticker.tick().await;
+            let (same_session, running, frame) = {
+                let active = state.capture.lock();
+                match active.as_ref() {
+                    Some(session) if session.id() == capture_id => (
+                        true,
+                        session.is_running(),
+                        session.latest_jpeg_after(last_sequence),
+                    ),
+                    _ => (false, false, None),
+                }
             };
-            let Some(jpeg) = frame else {
-                // Session gone: clean EOF. No frame yet: wait a tick.
-                if state.capture.lock().is_none() {
+            if !same_session {
+                break;
+            }
+            let Some((sequence, jpeg)) = frame else {
+                // No duplicate parts: if capture is slower than its requested
+                // ceiling, wait for a genuinely new frame. A failed worker
+                // ends after the final cached frame instead of freezing open.
+                if !running && last_sequence != 0 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             };
-            let mut part = format!(
+            last_sequence = sequence;
+            let header = format!(
                 "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
                 jpeg.len()
-            )
-            .into_bytes();
-            part.extend_from_slice(&jpeg);
-            part.extend_from_slice(b"\r\n");
-            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(part));
-            tokio::time::sleep(interval).await;
+            );
+            // Avoid copying each full JPEG into a fresh multipart buffer.
+            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(header));
+            yield Ok::<_, std::convert::Infallible>(jpeg);
+            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"\r\n"));
         }
     };
     let mut res = axum::body::Body::from_stream(stream).into_response();
@@ -380,6 +416,10 @@ async fn capture_snapshot(
         Display(Option<u32>),
         Window(u32),
     }
+    enum ResolvedTarget {
+        Display(u32),
+        Window(u32),
+    }
     let target: Result<Target, String> = match (params.get("display_id"), params.get("window_id")) {
         (Some(_), Some(_)) => Err("only one of display_id, window_id".to_string()),
         (None, None) => Err("display_id or window_id required".to_string()),
@@ -400,6 +440,20 @@ async fn capture_snapshot(
             .map(Target::Window)
             .map_err(|_| "invalid window_id".to_string()),
     };
+    // Validate routing before the permission probe. Malformed and stale ids
+    // are deterministic 400s even on a machine where capture is denied.
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            let mut res = (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response();
+            apply_cors(&s.state, &headers, res.headers_mut());
+            return with_no_store(res);
+        }
+    };
     // Lenient like `capture_size`: missing, empty, or non-numeric widths
     // fall back to the default; out-of-range values clamp (never 400 — the
     // target is already validated above, so the size cannot misroute).
@@ -409,6 +463,44 @@ async fn capture_snapshot(
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(crate::capture::SNAPSHOT_DEFAULT_WIDTH),
     );
+    // Listing does not request capture permission. Resolve stale picker ids
+    // first so they remain deterministic 400s even when the OS permission is
+    // currently denied, and keep enumeration off Tokio's request workers.
+    let resolved =
+        tokio::task::spawn_blocking(move || -> Result<ResolvedTarget, (StatusCode, String)> {
+            match target {
+                Target::Display(requested) => {
+                    let displays =
+                        crate::capture::list_displays().map_err(|_| snapshot_unavailable())?;
+                    let display =
+                        select_display(&displays, requested).ok_or_else(|| match requested {
+                            Some(id) => {
+                                (StatusCode::BAD_REQUEST, format!("display {id} not found"))
+                            }
+                            None => snapshot_unavailable(),
+                        })?;
+                    Ok(ResolvedTarget::Display(display.id))
+                }
+                Target::Window(id) => {
+                    let windows =
+                        crate::capture::list_windows().map_err(|_| snapshot_unavailable())?;
+                    let window = select_window(&windows, id).ok_or_else(|| {
+                        (StatusCode::BAD_REQUEST, format!("window {id} not found"))
+                    })?;
+                    Ok(ResolvedTarget::Window(window.id))
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(snapshot_unavailable()));
+    let target = match resolved {
+        Ok(target) => target,
+        Err((status, error)) => {
+            let mut res = (status, Json(serde_json::json!({"error": error}))).into_response();
+            apply_cors(&s.state, &headers, res.headers_mut());
+            return with_no_store(res);
+        }
+    };
     // The OS prompt must fire from an explicit confirm, never from the
     // picker's 1s preview poll: when the probe says blocked, fail fast with
     // 503 without touching the capture API (which is what re-opens the
@@ -422,29 +514,18 @@ async fn capture_snapshot(
         apply_cors(&s.state, &headers, denied.headers_mut());
         return with_no_store(denied);
     }
-    let snapshot: Result<Vec<u8>, (StatusCode, String)> = (|| {
-        let target = target.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let snapshot = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, (StatusCode, String)> {
         match target {
-            Target::Display(requested) => {
-                let displays =
-                    crate::capture::list_displays().map_err(|_| snapshot_unavailable())?;
-                let display =
-                    select_display(&displays, requested).ok_or_else(|| match requested {
-                        Some(id) => (StatusCode::BAD_REQUEST, format!("display {id} not found")),
-                        None => snapshot_unavailable(),
-                    })?;
-                crate::capture::snapshot_display(display.id, width)
-                    .map_err(|_| snapshot_unavailable())
+            ResolvedTarget::Display(id) => {
+                crate::capture::snapshot_display(id, width).map_err(|_| snapshot_unavailable())
             }
-            Target::Window(id) => {
-                let windows = crate::capture::list_windows().map_err(|_| snapshot_unavailable())?;
-                let window = select_window(&windows, id)
-                    .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("window {id} not found")))?;
-                crate::capture::snapshot_window(window.id, width)
-                    .map_err(|_| snapshot_unavailable())
+            ResolvedTarget::Window(id) => {
+                crate::capture::snapshot_window(id, width).map_err(|_| snapshot_unavailable())
             }
         }
-    })();
+    })
+    .await
+    .unwrap_or_else(|_| Err(snapshot_unavailable()));
     let mut res = match snapshot {
         Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes).into_response(),
         Err((status, error)) => (status, Json(serde_json::json!({"error": error}))).into_response(),
@@ -578,7 +659,8 @@ async fn capture_start(
     let (width, height, fps) = capture_size(body_value);
     let requested_display = capture_display_request(body_value);
     let requested_window = capture_window_request(body_value);
-    let started = (|| -> Result<serde_json::Value, (StatusCode, String)> {
+    let prepared = tokio::task::spawn_blocking(
+        move || -> Result<(crate::capture::CaptureSession, serde_json::Value), (StatusCode, String)> {
         // Exactly one target: both or neither is a 400, never a guess.
         // Garbage ids fail closed before any OS enumeration runs.
         match (requested_display, requested_window) {
@@ -606,11 +688,12 @@ async fn capture_start(
                     .start(display.id, width, height, fps)
                     .map_err(start_capture_status)?;
                 let live_id = session.display_id();
+                let capture_id = session.id().to_string();
                 let (got_w, got_h, got_fps) = (width, height, session.fps());
-                s.state.capture.lock().replace(session);
-                Ok(
-                    serde_json::json!({"started": true, "display_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
-                )
+                Ok((
+                    session,
+                    serde_json::json!({"started": true, "capture_id": capture_id, "display_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
+                ))
             }
             (DisplayRequest::Primary, WindowRequest::Window(id)) => {
                 let windows = crate::capture::list_windows()
@@ -622,14 +705,34 @@ async fn capture_start(
                     .start_window(window.id, width, height, fps)
                     .map_err(start_capture_status)?;
                 let live_id = session.window_id();
+                let capture_id = session.id().to_string();
                 let (got_w, got_h, got_fps) = (width, height, session.fps());
-                s.state.capture.lock().replace(session);
-                Ok(
-                    serde_json::json!({"started": true, "window_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
-                )
+                Ok((
+                    session,
+                    serde_json::json!({"started": true, "capture_id": capture_id, "window_id": live_id, "width": got_w, "height": got_h, "fps": got_fps}),
+                ))
             }
         }
-    })();
+    },
+    )
+    .await;
+    let started = match prepared {
+        Ok(Ok((session, body))) => {
+            let replaced = s.state.capture.lock().replace(session);
+            // Joining the previous grab worker can take up to one capture
+            // interval. Never make this async request worker (or the state
+            // mutex) wait for it during a resolution/FPS switch.
+            if let Some(previous) = replaced {
+                tokio::task::spawn_blocking(move || drop(previous));
+            }
+            Ok(body)
+        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("capture worker failed: {error}"),
+        )),
+    };
     let mut res = match started {
         Ok(body) => Json(body).into_response(),
         Err((status, error)) => (status, Json(serde_json::json!({"error": error}))).into_response(),
@@ -638,12 +741,44 @@ async fn capture_start(
     with_no_store(res)
 }
 
-async fn capture_stop(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
-    *s.state.capture.lock() = None;
-    // The audio mix belongs to the session: ending it here closes any live
-    // `/audio/stream` body on its next tick (clean EOF, not a hang).
-    s.state.audio_tap.lock().stop();
-    let mut res = Json(serde_json::json!({"stopped": true})).into_response();
+async fn capture_stop(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let requested_id = body.as_ref().and_then(|Json(value)| {
+        value.get("capture_id").and_then(|id| {
+            id.as_str()
+                .and_then(|id| id.parse::<u64>().ok())
+                .or_else(|| id.as_u64())
+        })
+    });
+    let conditional = body.is_some();
+    let removed = {
+        let mut active = s.state.capture.lock();
+        let matches = match (conditional, requested_id, active.as_ref()) {
+            (false, _, _) => true, // Backward compatibility with old web clients.
+            (true, Some(wanted), Some(session)) => session.id() == wanted,
+            _ => false,
+        };
+        if matches {
+            active.take()
+        } else {
+            None
+        }
+    };
+    let stopped = removed.is_some() || !conditional;
+    // Drop joins the capture worker outside both the AppState mutex and the
+    // async runtime worker, so shutdown cannot stall loopback requests.
+    if let Some(session) = removed {
+        tokio::task::spawn_blocking(move || drop(session));
+    }
+    if stopped {
+        // The audio mix belongs to the session: ending it here closes any live
+        // `/audio/stream` body on its next tick (clean EOF, not a hang).
+        s.state.audio_tap.lock().stop();
+    }
+    let mut res = Json(serde_json::json!({"stopped": stopped})).into_response();
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
@@ -658,6 +793,9 @@ async fn capture_stop(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
 /// Fail-fast ceiling for one ranged read. The engine blocks on slow swarms
 /// by design; the loopback caller gets a 504 instead of a hung fetch.
 const TORRENT_READ_TIMEOUT: Duration = Duration::from_secs(90);
+/// Keep torrent response latency and per-read allocation bounded. librqbit's
+/// reader still performs its own wider piece lookahead behind this adapter.
+const TORRENT_STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
 fn torrent_unavailable() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -963,12 +1101,12 @@ async fn torrent_data(
             return with_no_store(with_unsatisfiable(res, total));
         }
     };
-    let read = tokio::time::timeout(
+    let opened = tokio::time::timeout(
         TORRENT_READ_TIMEOUT,
-        manager.read_range(&id, index, start..end),
+        manager.open_range(&id, index, start..end),
     )
     .await;
-    let mut res = match read {
+    let mut res = match opened {
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             Json(serde_json::json!({"error": "timeout"})),
@@ -983,8 +1121,43 @@ async fn torrent_data(
             }
             res
         }
-        Ok(Ok((bytes, _))) => {
-            let mut res = (StatusCode::PARTIAL_CONTENT, bytes).into_response();
+        Ok(Ok((mut source, range_len, _))) => {
+            let stream = async_stream::stream! {
+                let mut remaining = range_len;
+                while remaining > 0 {
+                    let capacity = remaining.min(TORRENT_STREAM_CHUNK_BYTES as u64) as usize;
+                    let mut chunk = vec![0_u8; capacity];
+                    let read = match tokio::time::timeout(
+                        TORRENT_READ_TIMEOUT,
+                        source.read(&mut chunk),
+                    ).await {
+                        Ok(Ok(read)) => read,
+                        Ok(Err(error)) => {
+                            yield Err::<axum::body::Bytes, std::io::Error>(error);
+                            break;
+                        }
+                        Err(_) => {
+                            yield Err::<axum::body::Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "torrent stream timed out",
+                            ));
+                            break;
+                        }
+                    };
+                    if read == 0 {
+                        yield Err::<axum::body::Bytes, std::io::Error>(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "torrent stream ended before the requested range",
+                        ));
+                        break;
+                    }
+                    chunk.truncate(read);
+                    remaining -= read as u64;
+                    yield Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(chunk));
+                }
+            };
+            let mut res = axum::body::Body::from_stream(stream).into_response();
+            *res.status_mut() = StatusCode::PARTIAL_CONTENT;
             res.headers_mut().insert(
                 axum::http::header::ACCEPT_RANGES,
                 HeaderValue::from_static("bytes"),
@@ -993,6 +1166,10 @@ async fn torrent_data(
                 axum::http::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             );
+            if let Ok(value) = HeaderValue::from_str(&range_len.to_string()) {
+                res.headers_mut()
+                    .insert(axum::http::header::CONTENT_LENGTH, value);
+            }
             with_content_range(res, start, end, total)
         }
     };
@@ -1333,7 +1510,7 @@ mod tests {
         assert_eq!(v["capabilities"]["screen"]["maxHeight"], 2160);
         assert_eq!(v["capabilities"]["screen"]["maxFps"], 60);
         assert_eq!(v["capabilities"]["audio"]["appList"], false);
-        // Wired on macOS/Windows (the PCM tap compiles in), stubbed Linux.
+        // System-audio PCM is wired on macOS; Windows/Linux stay honestly off.
         assert_eq!(
             v["capabilities"]["audio"]["capture"],
             crate::audio_engine::capture_supported()
@@ -1615,6 +1792,7 @@ mod tests {
         let res = capture_stop(
             State(state_with(&["https://beta.juntos.lol"])),
             origin_headers("https://beta.juntos.lol"),
+            None,
         )
         .await
         .into_response();
@@ -1628,6 +1806,41 @@ mod tests {
         let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v, serde_json::json!({"stopped": true}));
+    }
+
+    #[tokio::test]
+    async fn capture_stop_token_cannot_remove_a_replacement_session() {
+        let state = state_with(&["https://beta.juntos.lol"]);
+        let session = crate::capture::CaptureSession::new();
+        let live_id = session.id();
+        state.state.capture.lock().replace(session);
+
+        let res = capture_stop(
+            State(state.clone()),
+            origin_headers("https://beta.juntos.lol"),
+            Some(Json(serde_json::json!({"capture_id": live_id + 1}))),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"stopped": false}));
+        assert_eq!(
+            state.state.capture.lock().as_ref().map(|s| s.id()),
+            Some(live_id)
+        );
+
+        let res = capture_stop(
+            State(state.clone()),
+            origin_headers("https://beta.juntos.lol"),
+            Some(Json(serde_json::json!({"capture_id": live_id.to_string()}))),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"stopped": true}));
+        assert!(state.state.capture.lock().is_none());
     }
 
     #[tokio::test]
@@ -1685,6 +1898,7 @@ mod tests {
         assert!(!state.state.audio.lock().muted_apps.contains("discord"));
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn audio_stream_idle_is_404() {
         // No capture session: the mix has no owner, so 404 + idle — same
@@ -1735,10 +1949,10 @@ mod tests {
         assert_eq!(v, serde_json::json!({"error": "idle"}));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn audio_stream_unwired_is_501() {
-        // Linux has no tap: even with a session the route stays 501.
+        // Windows/Linux have no tap: even with a session the route stays 501.
         let state = state_with(&["https://beta.juntos.lol"]);
         *state.state.capture.lock() = Some(crate::capture::CaptureSession::new());
         let res = audio_stream(State(state), origin_headers("https://beta.juntos.lol"))
@@ -1750,7 +1964,7 @@ mod tests {
         assert!(v.get("error").is_some(), "{v}");
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn audio_stream_serves_pcm_while_live() {
         // A live session upgrades the route to 200 + the L16 content type.
