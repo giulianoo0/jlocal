@@ -104,6 +104,7 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/capture/windows", get(capture_windows))
         .route("/capture/preview.jpg", get(capture_preview))
         .route("/capture/snapshot", get(capture_snapshot))
+        .route("/capture/stream", get(capture_stream))
         .route("/capture/start", post(capture_start))
         .route("/capture/stop", post(capture_stop))
         .route("/torrent/add", post(torrent_add))
@@ -124,6 +125,7 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/capture/windows", axum::routing::options(preflight))
         .route("/capture/preview.jpg", axum::routing::options(preflight))
         .route("/capture/snapshot", axum::routing::options(preflight))
+        .route("/capture/stream", axum::routing::options(preflight))
         .route("/capture/start", axum::routing::options(preflight))
         .route("/capture/stop", axum::routing::options(preflight))
         .route("/torrent/add", axum::routing::options(preflight))
@@ -296,6 +298,64 @@ async fn capture_preview(State(s): State<ApiState>, headers: HeaderMap) -> impl 
         )
             .into_response(),
     };
+    apply_cors(&s.state, &headers, res.headers_mut());
+
+    with_no_store(res)
+}
+
+/// Live MJPEG feed of the running session: `GET /capture/stream` answers
+/// `multipart/x-mixed-replace;boundary=frame` with one JPEG part per tick at
+/// the session's rate, ending when the session stops. 404 while idle.
+/// The web feed reads this with fetch+reader (one connection, server-paced)
+/// instead of polling preview.jpg — polling stacks HTTP overhead and
+/// overlapping in-flight grabs at 60fps and can never look smooth.
+/// CORS + no-store like every capture route.
+async fn capture_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let live_fps = { s.state.capture.lock().as_ref().map(|session| session.fps()) };
+    let Some(fps) = live_fps else {
+        let mut res = (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "idle"})),
+        )
+            .into_response();
+        apply_cors(&s.state, &headers, res.headers_mut());
+        return with_no_store(res);
+    };
+    let state = s.state.clone();
+    let interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
+    let stream = async_stream::stream! {
+        loop {
+            let frame = {
+                state
+                    .capture
+                    .lock()
+                    .as_ref()
+                    .and_then(|session| session.latest_jpeg(90))
+            };
+            let Some(jpeg) = frame else {
+                // Session gone: clean EOF. No frame yet: wait a tick.
+                if state.capture.lock().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            let mut part = format!(
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                jpeg.len()
+            )
+            .into_bytes();
+            part.extend_from_slice(&jpeg);
+            part.extend_from_slice(b"\r\n");
+            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(part));
+            tokio::time::sleep(interval).await;
+        }
+    };
+    let mut res = axum::body::Body::from_stream(stream).into_response();
+    res.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("multipart/x-mixed-replace;boundary=frame"),
+    );
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
@@ -1647,6 +1707,28 @@ mod tests {
                 .get(axum::http::header::CACHE_CONTROL)
                 .and_then(|v| v.to_str().ok()),
             Some("no-store")
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"error": "idle"}));
+    }
+
+    #[tokio::test]
+    async fn capture_stream_idle_is_404() {
+        // No capture session: no frames to serve, so 404 + idle — same
+        // envelope as the preview endpoint, CORS + no-store intact.
+        let res = capture_stream(
+            State(state_with(&["https://beta.juntos.lol"])),
+            origin_headers("https://beta.juntos.lol"),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("https://beta.juntos.lol")
         );
         let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();

@@ -562,8 +562,10 @@ impl CaptureSession {
     /// Begin (or restart) grabbing `display_id` at `width`x`height` @ `fps`.
     ///
     /// - `fps` is clamped to `1..=60`.
-    /// - `width`/`height` must be non-zero and fit inside the display;
-    ///   anything larger is rejected (no upscaling).
+    /// - `width`/`height` must be non-zero and within the encode ceiling
+    ///   ([`MAX_CAPTURE_WIDTH`]x[`MAX_CAPTURE_HEIGHT`]); larger than the
+    ///   target is fine — the worker upscales, so quality presets (4K on a
+    ///   smaller display, like Discord) always work.
     /// - Unknown `display_id` (e.g. unplugged since [`list_displays`]) is an
     pub fn start(
         &mut self,
@@ -579,12 +581,8 @@ impl CaptureSession {
             .into_iter()
             .find(|m| m.id().unwrap_or(u32::MAX) == display_id);
         let monitor = monitor.ok_or_else(|| anyhow::anyhow!("display {display_id} not found"))?;
-        let (disp_w, disp_h) = dimension_of(&monitor)?;
-        if width > disp_w || height > disp_h {
-            anyhow::bail!(
-                "requested {width}x{height} exceeds display {display_id} size {disp_w}x{disp_h}"
-            );
-        }
+        let (_disp_w, _disp_h) = dimension_of(&monitor)?;
+        validate_encode_size(width, height)?;
 
         // Validation passed: safe to replace any running session.
         self.launch(CaptureTarget::Display(display_id), width, height, fps)
@@ -592,8 +590,8 @@ impl CaptureSession {
 
     /// Begin (or restart) grabbing `window_id` at `width`x`height` @ `fps`.
     ///
-    /// Same contract as [`CaptureSession::start`], against the window's
-    /// dimensions instead of a monitor's. A window closed between
+    /// Same contract as [`CaptureSession::start`]: the encode size may exceed
+    /// the window (upscaled, Discord-style). A window closed between
     /// [`list_windows`] and here is an error, not a panic. Failed validation
     /// leaves a running session untouched.
     pub fn start_window(
@@ -610,12 +608,8 @@ impl CaptureSession {
             .into_iter()
             .find(|w| w.id().unwrap_or(u32::MAX) == window_id);
         let window = window.ok_or_else(|| anyhow::anyhow!("window {window_id} not found"))?;
-        let (win_w, win_h) = window_dimensions(&window)?;
-        if width > win_w || height > win_h {
-            anyhow::bail!(
-                "requested {width}x{height} exceeds window {window_id} size {win_w}x{win_h}"
-            );
-        }
+        let (_win_w, _win_h) = window_dimensions(&window)?;
+        validate_encode_size(width, height)?;
 
         // Validation passed: safe to replace any running session.
         self.launch(CaptureTarget::Window(window_id), width, height, fps)
@@ -920,14 +914,8 @@ fn grab_loop(
     }
 }
 
-/// Clamp the requested rate into the supported `1..=60` range.
-fn clamp_fps(fps: u32) -> u32 {
-    fps.clamp(MIN_FPS, MAX_FPS)
-}
-
-/// Reject empty requests up front (oversize-vs-target is checked in
-/// [`CaptureSession::start`] / [`CaptureSession::start_window`], which know
-/// the target's dimensions).
+/// Reject empty requests up front (encode-ceiling checks live in
+/// [`validate_encode_size`], used by start paths that upscale).
 fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
     if width == 0 || height == 0 {
         anyhow::bail!("capture size must be non-zero, got {width}x{height}");
@@ -935,15 +923,39 @@ fn validate_size(width: u32, height: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn dimension_of(monitor: &xcap::Monitor) -> anyhow::Result<(u32, u32)> {
-    let w = monitor.width().context("display is missing its width")?;
-    let h = monitor.height().context("display is missing its height")?;
-    Ok((w, h))
+/// Encode ceiling: quality presets may exceed the target (upscaled
+/// Discord-style), but never exceed what the encoder pipeline is built for.
+pub const MAX_CAPTURE_WIDTH: u32 = 3840;
+pub const MAX_CAPTURE_HEIGHT: u32 = 2160;
+
+/// Non-zero size within the encode ceiling. Larger than the target is fine
+/// (the worker upscales); larger than the ceiling is a 400.
+fn validate_encode_size(width: u32, height: u32) -> anyhow::Result<()> {
+    validate_size(width, height)?;
+    if width > MAX_CAPTURE_WIDTH || height > MAX_CAPTURE_HEIGHT {
+        anyhow::bail!(
+            "requested {width}x{height} exceeds encode ceiling {}x{}",
+            MAX_CAPTURE_WIDTH,
+            MAX_CAPTURE_HEIGHT
+        );
+    }
+    Ok(())
+}
+
+/// Clamp the requested rate into the supported `1..=60` range.
+fn clamp_fps(fps: u32) -> u32 {
+    fps.clamp(1, 60)
 }
 
 fn window_dimensions(window: &xcap::Window) -> anyhow::Result<(u32, u32)> {
     let w = window.width().context("window is missing its width")?;
     let h = window.height().context("window is missing its height")?;
+    Ok((w, h))
+}
+
+fn dimension_of(monitor: &xcap::Monitor) -> anyhow::Result<(u32, u32)> {
+    let w = monitor.width().context("display is missing its width")?;
+    let h = monitor.height().context("display is missing its height")?;
     Ok((w, h))
 }
 
