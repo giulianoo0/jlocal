@@ -57,12 +57,12 @@ pub const SAMPLES_PER_CHUNK: usize = FRAMES_PER_CHUNK * CHANNELS as usize;
 pub const BYTES_PER_CHUNK: usize = SAMPLES_PER_CHUNK * 2;
 /// `Content-Type` for the raw PCM body (RFC 2046 `audio/L16` parameters).
 pub const CONTENT_TYPE: &str = "audio/L16; rate=48000; channels=2";
-
-/// Whether this OS has a capture backend. macOS and Windows do; Linux is an
-/// honest stub (the route answers `501` there). The caps flag
-/// `audio.capture` rides on this.
+/// Whether this OS has a capture backend. macOS only for now: Windows is
+/// stubbed until its loopback taps can be compile-checked on a Windows host
+/// (see the Windows note at `platform_start`); Linux was never wired. The
+/// caps flag `audio.capture` rides on this.
 pub fn capture_supported() -> bool {
-    cfg!(any(target_os = "macos", target_os = "windows"))
+    cfg!(target_os = "macos")
 }
 
 /// One tap's decoded audio: stereo-interleaved `i16` at [`SAMPLE_RATE`].
@@ -331,9 +331,9 @@ impl Default for AudioTap {
     }
 }
 
-/// Only the macOS/Windows backends below use this; the stub platforms go
-/// through parking_lot directly, so the definition is gated the same way.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// Only the macOS backend below uses this; every other platform goes through
+/// parking_lot directly, so the definition is gated the same way.
+#[cfg(target_os = "macos")]
 fn lock<T>(m: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
     m.lock()
 }
@@ -369,44 +369,18 @@ fn platform_set_excluded(tap: &AudioTap, muted: &HashSet<String>) {
     }
 }
 
+/// Windows: stubbed for now. The WASAPI per-process loopback design is
+/// sketched in git history, but blind cross-compiled COM cannot be verified
+/// here — revive it with a Windows host that can compile and listen. Until
+/// then Windows answers 501 on `/audio/stream` exactly like Linux, and
+/// `caps.audio.capture` stays false there.
 #[cfg(target_os = "windows")]
-fn platform_start(tap: &AudioTap, muted: &HashSet<String>) -> anyhow::Result<()> {
-    let excluded: Vec<String> = muted.iter().cloned().collect();
-    let (frames_tx, frames_rx) = crossbeam_channel::bounded::<AppFrame>(256);
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let extra = win_taps::run_taps(worker_stop, frames_tx, &excluded);
-    let thread = std::thread::Builder::new()
-        .name("jlocal-audio-tap".into())
-        .spawn(move || {
-            // Supervisor: parks until stop; per-process threads own the COM.
-            while !worker_stop.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("failed to spawn audio tap thread: {e}"))?;
-    let mut state = lock(&tap.inner);
-    state.stop = stop;
-    state.worker = Some(thread);
-    state.frames_tx = None;
-    state.frames_rx = Some(frames_rx);
-    state.extra_stops = extra;
-    Ok(())
+fn platform_start(_tap: &AudioTap, _muted: &HashSet<String>) -> anyhow::Result<()> {
+    anyhow::bail!("system-audio capture is not implemented on this OS yet")
 }
 
 #[cfg(target_os = "windows")]
-fn platform_set_excluded(tap: &AudioTap, muted: &HashSet<String>) {
-    // Per-process taps can't shed one process from a running client, so a
-    // mute change restarts the tap set. Running state survives (same
-    // `AudioTap`), the cost is a ~100 ms silence gap while clients reopen.
-    let was_running = lock(&tap.inner).running;
-    if !was_running {
-        return;
-    }
-    tap.stop();
-    let _ = tap.start(muted);
-    lock(&tap.inner).running = true;
-}
+fn platform_set_excluded(_tap: &AudioTap, _muted: &HashSet<String>) {}
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_start(_tap: &AudioTap, _muted: &HashSet<String>) -> anyhow::Result<()> {
@@ -789,300 +763,7 @@ mod macos {
     }
 }
 
-// ---- Windows: per-process WASAPI loopback taps ----
-
-/// Windows backend: one WASAPI process-loopback client per audible GUI
-/// process (`ActivateAudioInterfaceAsync` on
-/// `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` with
-/// `INCLUDE_TARGET_PROCESS_TREE`), each decoded to 48 kHz stereo and mixed
-/// here with the muted set dropped.
-///
-/// Compiled on Windows only (this mac can't check it — CI's
-/// windows-latest runner does), so it stays small and straight-line on
-/// purpose: one fallible step after another, `Err` on any failure, and the
-/// caller skips that process. Empty tap set = silence, never an error.
-#[cfg(target_os = "windows")]
-mod win_taps {
-    use super::*;
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Media::Audio::{
-        ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
-        IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-        IAudioCaptureClient, IAudioClient, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-        PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, PROCESS_LOOPBACK_PARAMS,
-        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
-        WAVE_FORMAT_EXTENSIBLE,
-    };
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
-    use windows::Win32::UI::Shell::PropertiesSystem::InitPropVariantFromBuffer;
-    use windows_core::{implement, Ref, GUID, HRESULT};
-
-    /// Audible-process candidates: GUI processes from the process table with
-    /// their pids, minus the exclusion set. Names reuse the
-    /// `/capture/windows` `app` id space (lowercased process name).
-    fn audible_processes(excluded: &[String]) -> Vec<(u32, String)> {
-        let mut system = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::nothing().with_processes(sysinfo::UpdateKind::OnlyIfNotSet),
-        );
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        let mut out = Vec::new();
-        for (pid, process) in system.processes() {
-            let name = process.name().to_string_lossy().into_owned();
-            if name.is_empty() {
-                continue;
-            }
-            let id = name.to_lowercase();
-            if excluded.iter().any(|m| m == &id) {
-                continue;
-            }
-            out.push((pid.as_u32(), id));
-        }
-        out.sort();
-        out.dedup();
-        out.truncate(64);
-        out
-    }
-
-    /// Completion sink for `ActivateAudioInterfaceAsync`: wakes the opener
-    /// with the activated `IAudioClient` (or the failure).
-    #[implement(IActivateAudioInterfaceCompletionHandler)]
-    struct ActivationHandler {
-        tx: std::sync::mpsc::Sender<windows_core::Result<IAudioClient>>,
-    }
-
-    impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler {
-        fn ActivateCompleted(
-            &self,
-            operation: Ref<'_, IActivateAudioInterfaceAsyncOperation>,
-        ) -> windows_core::Result<()> {
-            let result: windows_core::Result<IAudioClient> = unsafe {
-                operation
-                    .as_ref()
-                    .ok_or_else(|| windows_core::Error::from(HRESULT(-2147467259)))
-                    .and_then(|op| op.GetActivateResult())
-            };
-            let _ = self.tx.send(result);
-            Ok(())
-        }
-    }
-
-    /// Open one process-loopback `IAudioClient` for `pid`. Fails closed on
-    /// any COM error — the caller skips that process.
-    unsafe fn open_process_loopback(pid: u32) -> anyhow::Result<IAudioClient> {
-        unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)
-                .ok()
-                .map_err(|e| anyhow::anyhow!("COM init failed: {e}"))?;
-        }
-        let params = AUDIOCLIENT_ACTIVATION_PARAMS {
-            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-            Anonymous: windows::Win32::Media::Audio::AUDIOCLIENT_ACTIVATION_PARAMS_0 {
-                ProcessLoopbackParams: PROCESS_LOOPBACK_PARAMS {
-                    TargetProcessId: windows::Win32::Foundation::HANDLE(pid as _),
-                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
-                },
-            },
-        };
-        // SAFETY: packed struct bytes handed to the activation call; the
-        // PROPVARIANT owns its copy once created.
-        let blob = unsafe {
-            std::slice::from_raw_parts(
-                (&params as *const AUDIOCLIENT_ACTIVATION_PARAMS).cast::<u8>(),
-                size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>(),
-            )
-        };
-        let prop = InitPropVariantFromBuffer(blob)
-            .map_err(|e| anyhow::anyhow!("activation params failed: {e}"))?;
-        let (tx, rx) = std::sync::mpsc::channel::<windows_core::Result<IAudioClient>>();
-        let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler { tx }.into();
-        let path: Vec<u16> = std::ffi::OsStr::new(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK)
-            .encode_wide()
-            .chain([0])
-            .collect();
-        let operation = unsafe {
-            ActivateAudioInterfaceAsync(
-                windows_core::PCWSTR(path.as_ptr()),
-                &IAudioClient::IID,
-                Some(&prop),
-                &handler,
-            )
-        }
-        .map_err(|e| anyhow::anyhow!("loopback activation failed: {e}"))?;
-        // Keep the operation alive until our completion fires.
-        let _live = operation;
-        rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| anyhow::anyhow!("loopback activation timed out for pid {pid}"))?
-            .map_err(|e| anyhow::anyhow!("loopback activation failed for pid {pid}: {e}"))
-    }
-
-    /// Capture loop for one process: reads loopback packets, decodes to
-    /// 48 kHz stereo `i16`, forwards [`AppFrame`]s. Ends on `stop` or on a
-    /// hard audio error (process died, device lost).
-    unsafe fn capture_process(
-        pid: u32,
-        app: String,
-        stop: Arc<AtomicBool>,
-        tx: crossbeam_channel::Sender<AppFrame>,
-    ) {
-        unsafe {
-            let client = match open_process_loopback(pid) {
-                Ok(client) => client,
-                Err(_) => {
-                    CoUninitialize();
-                    return;
-                }
-            };
-            let wave: *mut WAVEFORMATEX = match client.GetMixFormat() {
-                Ok(wave) => wave,
-                Err(_) => {
-                    CoUninitialize();
-                    return;
-                }
-            };
-            let (rate, channels, is_float) =
-                if (*wave).wFormatTag as u32 == WAVE_FORMAT_EXTENSIBLE as u32 {
-                    let ext = wave.cast::<WAVEFORMATEXTENSIBLE>();
-                    (
-                        (*wave).nSamplesPerSec,
-                        (*wave).nChannels,
-                        (*ext).SubFormat
-                            == GUID::from_values(
-                                0x0000_0003,
-                                0x0000,
-                                0x0010,
-                                [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
-                            ),
-                    )
-                } else {
-                    ((*wave).nSamplesPerSec, (*wave).nChannels, false)
-                };
-            if client
-                .Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_LOOPBACK,
-                    0,
-                    0,
-                    wave,
-                    None,
-                )
-                .is_err()
-            {
-                CoUninitialize();
-                return;
-            }
-            let capture: IAudioCaptureClient = match client.GetService() {
-                Ok(capture) => capture,
-                Err(_) => {
-                    CoUninitialize();
-                    return;
-                }
-            };
-            if client.Start().is_err() {
-                CoUninitialize();
-                return;
-            }
-            while !stop.load(Ordering::SeqCst) {
-                let frames = match capture.GetNextPacketSize() {
-                    Ok(frames) => frames,
-                    Err(_) => break,
-                };
-                if frames == 0 {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                let mut data: *mut u8 = std::ptr::null_mut();
-                let mut read: u32 = 0;
-                let mut flags: u32 = 0;
-                if capture
-                    .GetBuffer(&mut data, &mut read, &mut flags, None, None)
-                    .is_err()
-                    || data.is_null()
-                {
-                    break;
-                }
-                const SILENT: u32 = 1; // AUDCLNT_BUFFERFLAGS_SILENT
-                let samples = if flags & SILENT != 0 || !is_float {
-                    vec![0i16; read as usize * super::CHANNELS as usize]
-                } else {
-                    let floats = std::slice::from_raw_parts(
-                        data.cast::<f32>(),
-                        read as usize * channels as usize,
-                    );
-                    let mut planar: Vec<&[f32]> = Vec::new();
-                    if channels == 1 {
-                        planar.push(floats);
-                    } else {
-                        // De-interleave the first two channels.
-                        let mut left = Vec::with_capacity(read as usize);
-                        let mut right = Vec::with_capacity(read as usize);
-                        for chunk in floats.chunks(channels as usize) {
-                            left.push(chunk[0]);
-                            right.push(*chunk.get(1).unwrap_or(&0.0));
-                        }
-                        // Hold the owned planes alive for the convert call.
-                        let owned = (left, right);
-                        let converted =
-                            super::f32_planar_to_s16_stereo(&[&owned.0, &owned.1], rate);
-                        let _ = planar;
-                        let _ = capture.ReleaseBuffer(read);
-                        if tx
-                            .try_send(AppFrame {
-                                app: app.clone(),
-                                samples: converted,
-                            })
-                            .is_err()
-                        {
-                            // Receiver gone: the tap stopped.
-                            let _ = client.Stop();
-                            CoUninitialize();
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-                    super::f32_planar_to_s16_stereo(&planar, rate)
-                };
-                let _ = capture.ReleaseBuffer(read);
-                if tx
-                    .try_send(AppFrame {
-                        app: app.clone(),
-                        samples,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            let _ = client.Stop();
-            CoUninitialize();
-        }
-    }
-
-    /// Spawn one capture thread per audible process. Returns their stop
-    /// flags so the tap can join them (threads exit on process death too).
-    pub(super) fn run_taps(
-        stop: Arc<AtomicBool>,
-        tx: crossbeam_channel::Sender<AppFrame>,
-        excluded: &[String],
-    ) -> Vec<Arc<AtomicBool>> {
-        let mut stops = Vec::new();
-        for (pid, app) in audible_processes(excluded) {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            let tap_stop = Arc::clone(&stop);
-            let frame_tx = tx.clone();
-            let name = app.clone();
-            stops.push(Arc::clone(&stop));
-            std::thread::Builder::new()
-                .name(format!("jlocal-audio-{pid}"))
-                .spawn(move || unsafe { capture_process(pid, name, tap_stop, frame_tx) })
-                .ok();
-        }
-        stops
-    }
-}
+// ---- Windows: stubbed (see platform_start above) ----
 
 #[cfg(test)]
 mod tests {
