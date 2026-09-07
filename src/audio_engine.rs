@@ -331,6 +331,9 @@ impl Default for AudioTap {
     }
 }
 
+/// Only the macOS/Windows backends below use this; the stub platforms go
+/// through parking_lot directly, so the definition is gated the same way.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn lock<T>(m: &parking_lot::Mutex<T>) -> parking_lot::MutexGuard<'_, T> {
     m.lock()
 }
@@ -372,7 +375,7 @@ fn platform_start(tap: &AudioTap, muted: &HashSet<String>) -> anyhow::Result<()>
     let (frames_tx, frames_rx) = crossbeam_channel::bounded::<AppFrame>(256);
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = Arc::clone(&stop);
-    let extra = windows::run_taps(worker_stop, frames_tx, &excluded);
+    let extra = win_taps::run_taps(worker_stop, frames_tx, &excluded);
     let thread = std::thread::Builder::new()
         .name("jlocal-audio-tap".into())
         .spawn(move || {
@@ -799,7 +802,7 @@ mod macos {
 /// purpose: one fallible step after another, `Err` on any failure, and the
 /// caller skips that process. Empty tap set = silence, never an error.
 #[cfg(target_os = "windows")]
-mod windows {
+mod win_taps {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Media::Audio::{

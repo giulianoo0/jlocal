@@ -427,8 +427,9 @@ fn window_icon_for_pid(_pid: u32) -> Option<String> {
     None
 }
 
-/// Fit `w`×`h` inside the [`ICON_SIZE`] box keeping the aspect ratio, each
-/// edge at least 1px. Pure integer math: the long edge lands on ICON_SIZE.
+/// Only the macOS/Windows icon paths (and their tests) use these; the Linux
+/// stub never does, so the definitions are gated the same way.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn icon_thumb_size(w: u32, h: u32) -> (u32, u32) {
     let m = w.max(h).max(1);
     ((w * ICON_SIZE / m).max(1), (h * ICON_SIZE / m).max(1))
@@ -439,6 +440,7 @@ fn icon_thumb_size(w: u32, h: u32) -> (u32, u32) {
 /// tight PNG, and wrap it as a data URL. Infallible by construction for
 /// real images: the PNG encoder only fails on OOM, and `from_raw` above
 /// already validated the buffer.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn icon_data_url(img: image::RgbaImage) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use image::ImageEncoder;
