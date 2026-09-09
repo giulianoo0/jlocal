@@ -5,14 +5,21 @@ share screen up to 4K60 via the MoQ relay, all through one tiny native app.
 
 > Loopback API + status/version window. Nothing else.
 
-The app itself has no web UI. It shows two things:
+The app itself has no web UI. Its window is a small status card (drawn
+in-process with `softbuffer` + bundled Inter, no toolkit):
 
-- **status**: connected / not connected + capture permission (window title + console + `/capabilities` → `permissions.screenCapture`)
-- **version**: the release tag (window title + `/version` + `--version`)
+- **Site**: connected + loopback endpoint (also `/health`)
+- **Gravação de tela**: OS capture consent, live probe (`/capabilities` → `permissions.screenCapture`)
+- **Torrent**: whether the local engine booted
+- **Atualização**: `vX.Y.Z disponível` / `em dia` / `verificando…`, with an
+  *Instalar vX.Y.Z* button when one is known and *Verificar atualizações*
+  otherwise; *Sair* quits.
 
 It also lives in the menubar tray (monotone icon): closing the window hides
-to the tray instead of quitting; the tray menu has Open + Check-for-updates
-+ Install-update (when one is known) + Quit.
+to the tray instead of quitting — on macOS the app also leaves the Dock until
+opened again — and the tray menu has *Abrir jlocal*, *Verificar
+atualizações*, *Instalar atualização vX* (when one is known) and *Sair do
+jlocal*. The version is also in `/version` and `--version`.
 
 ## Quickstart
 
@@ -62,11 +69,14 @@ state persists there for fastresume. No UPnP: the app never punches NAT holes.
 Reads ahead of the download block on the swarm (no prefetch beyond the
 engine's lookahead) and fail after 90s per read (`504`).
 
-Screen publish is still unwired: the relay speaks MoQ draft-16 and no Rust
-crate negotiates it (draft-18+/moq-lite only), so `screen.available` stays
-`false` and the web UI keeps routing to the browser picker. Capture
-endpoints above are live (real frames, advertised as `screen.capture`),
-ready for a transport when one exists.
+Screen publish is still unwired, but no longer for lack of a transport: the
+relay speaks drafts 14 and 16, and the Rust side of the same monorepo the
+web publisher comes from (`moq-net` pinned to `Ietf(Draft16)`, `moq-native`,
+`hang`) speaks draft-16. What is missing is the native encoder pipeline
+(hardware H.264 up to 4K60 + Opus) and the wiring; `src/publish.rs` pins the
+wire contract (`juntos/<room>/<secret>/<member>.hang`, hang catalog, `legacy`
+container). Until then `screen.available` stays `false` and the web UI keeps
+routing to the browser picker.
 
 Env: `JLOCAL_PORT` (default `40392`), `JLOCAL_NO_UI`, `JLOCAL_ALLOWED_ORIGINS`
 (comma-separated `https://` origins, replaces the juntos.lol + beta defaults),
@@ -78,8 +88,9 @@ On boot and every 6h the app `GET`s
 `https://github.com/giulianoo0/jlocal/releases/latest` without following
 redirects (10s timeout, best-effort, never blocks boot) and reads the newest
 tag off the 302's `location` (`…/releases/tag/vX.Y.Z`). When the tag is newer than its own build
-it shows `update available vX` in the window title and enables the tray's
-`Install update vX` item (plus a manual `Check for updates now` item).
+it shows `vX disponível` in the window (with an *Instalar vX* button) and
+enables the tray's *Instalar atualização vX* item (plus a manual
+*Verificar atualizações* item).
 Install downloads the release asset for the OS (`jlocal-<tag>-<target>.tar.gz`
 on macOS/Linux, `.zip` on Windows — the exact names `release.yml` uploads),
 swaps its own executable (inside `JLocal.app` it replaces

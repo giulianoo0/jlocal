@@ -28,6 +28,8 @@ reqwest = "0.13"
 tar = "0.4"
 flate2 = "1"
 crossbeam-channel = "0.5"
+softbuffer = "0.4"
+fontdue = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

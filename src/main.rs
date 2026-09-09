@@ -2,6 +2,7 @@
 
 use jlocal::{api, status};
 
+mod paint;
 mod ui;
 use std::net::{Ipv4Addr, SocketAddr};
 

@@ -40,6 +40,8 @@ pub struct UpdateState {
     pub last_checked_unix: u64,
     /// Last check failure, if any. Cleared by the next success.
     pub last_error: Option<String>,
+    /// A check or an install is in flight; the window says so.
+    pub busy: bool,
 }
 
 /// `true` when `latest` is a newer release than `current`.
