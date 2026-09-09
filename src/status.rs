@@ -73,6 +73,8 @@ pub struct AppState {
     pub allowed_origins: Vec<String>,
     pub caps: CapabilityFlags,
     pub capture: std::sync::Arc<parking_lot::Mutex<Option<crate::capture::CaptureSession>>>,
+    /// Hardware H.264 screen session (macOS), fed to `GET /capture/h264`.
+    pub h264: std::sync::Arc<parking_lot::Mutex<Option<crate::h264::H264Session>>>,
     pub audio: std::sync::Arc<parking_lot::Mutex<crate::audio::AudioState>>,
     /// Shared system-audio tap feeding `GET /audio/stream`. Started lazily
     /// by the first stream request while a capture session is live, stopped
@@ -107,6 +109,7 @@ impl AppState {
             allowed_origins,
             caps,
             capture: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            h264: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             audio: std::sync::Arc::new(parking_lot::Mutex::new(crate::audio::AudioState::new())),
             audio_tap: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::audio_engine::AudioTap::new(),
