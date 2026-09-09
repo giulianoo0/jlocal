@@ -66,6 +66,8 @@ struct CapabilitiesBody {
 struct ScreenCapabilities {
     available: bool,
     capture: bool,
+    /// Hardware H.264 access units over `GET /capture/h264` (macOS).
+    h264: bool,
     #[serde(rename = "maxWidth")]
     max_width: u32,
     #[serde(rename = "maxHeight")]
@@ -106,6 +108,7 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/capture/preview.jpg", get(capture_preview))
         .route("/capture/snapshot", get(capture_snapshot))
         .route("/capture/stream", get(capture_stream))
+        .route("/capture/h264", get(capture_h264))
         .route("/capture/start", post(capture_start))
         .route("/capture/stop", post(capture_stop))
         .route("/torrent/add", post(torrent_add))
@@ -127,6 +130,7 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/capture/preview.jpg", axum::routing::options(preflight))
         .route("/capture/snapshot", axum::routing::options(preflight))
         .route("/capture/stream", axum::routing::options(preflight))
+        .route("/capture/h264", axum::routing::options(preflight))
         .route("/capture/start", axum::routing::options(preflight))
         .route("/capture/stop", axum::routing::options(preflight))
         .route("/torrent/add", axum::routing::options(preflight))
@@ -219,6 +223,7 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
             screen: ScreenCapabilities {
                 available: s.state.caps.screen,
                 capture: s.state.caps.screen_capture,
+                h264: crate::h264::H264Session::supported(),
                 max_width: 3840,
                 max_height: 2160,
                 max_fps: 60,
@@ -659,6 +664,9 @@ async fn capture_start(
     let (width, height, fps) = capture_size(body_value);
     let requested_display = capture_display_request(body_value);
     let requested_window = capture_window_request(body_value);
+    if body_value.get("codec").and_then(|v| v.as_str()) == Some("h264") {
+        return h264_start(s, headers, body_value, width, height, fps, requested_display, requested_window).await;
+    }
     let prepared = tokio::task::spawn_blocking(
         move || -> Result<(crate::capture::CaptureSession, serde_json::Value), (StatusCode, String)> {
         // Exactly one target: both or neither is a 400, never a guess.
@@ -767,10 +775,24 @@ async fn capture_stop(
             None
         }
     };
-    let stopped = removed.is_some() || !conditional;
+    let encoded = if conditional && requested_id.is_some() {
+        // An id that names the JPEG session leaves the H.264 one alone, and
+        // vice versa; a body without a match stops nothing.
+        let mut slot = s.state.h264.lock();
+        match (requested_id, slot.as_ref()) {
+            (Some(wanted), Some(session)) if session.id() == wanted => slot.take(),
+            _ => None,
+        }
+    } else {
+        s.state.h264.lock().take()
+    };
+    let stopped = removed.is_some() || encoded.is_some() || !conditional;
     // Drop joins the capture worker outside both the AppState mutex and the
     // async runtime worker, so shutdown cannot stall loopback requests.
     if let Some(session) = removed {
+        tokio::task::spawn_blocking(move || drop(session));
+    }
+    if let Some(session) = encoded {
         tokio::task::spawn_blocking(move || drop(session));
     }
     if stopped {
@@ -779,6 +801,116 @@ async fn capture_stop(
         s.state.audio_tap.lock().stop();
     }
     let mut res = Json(serde_json::json!({"stopped": stopped})).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+/// Bits per pixel per second that keeps 4K60 crisp without drowning a home
+/// uplink: 4K60 lands near 45 Mb/s, 1080p60 near 11 Mb/s.
+const H264_BITS_PER_PIXEL_SECOND: f64 = 0.09;
+
+#[allow(clippy::too_many_arguments)]
+async fn h264_start(
+    s: ApiState,
+    headers: HeaderMap,
+    body: &serde_json::Value,
+    width: u32,
+    height: u32,
+    fps: u32,
+    display: DisplayRequest,
+    window: WindowRequest,
+) -> Response {
+    let target = match (display, window) {
+        (DisplayRequest::Invalid, _) => Err("invalid display_id".to_string()),
+        (_, WindowRequest::Invalid) => Err("invalid window_id".to_string()),
+        (DisplayRequest::Display(_), WindowRequest::Window(_)) => Err("only one of display_id, window_id".to_string()),
+        (DisplayRequest::Primary, WindowRequest::Absent) => Err("display_id or window_id required".to_string()),
+        (DisplayRequest::Display(id), WindowRequest::Absent) => Ok(crate::h264::H264Target::Display(id)),
+        (DisplayRequest::Primary, WindowRequest::Window(id)) => Ok(crate::h264::H264Target::Window(id)),
+    };
+    let outcome: Result<serde_json::Value, (StatusCode, String)> = match target {
+        Err(error) => Err((StatusCode::BAD_REQUEST, error)),
+        Ok(_) if !crate::h264::H264Session::supported() => Err((StatusCode::NOT_IMPLEMENTED, "h264 capture is macOS only".to_string())),
+        Ok(target) => {
+            let bitrate = body
+                .get("bitrate")
+                .and_then(|v| v.as_u64())
+                .map(|b| b as u32)
+                .unwrap_or_else(|| (f64::from(width) * f64::from(height) * f64::from(fps.max(1)) * H264_BITS_PER_PIXEL_SECOND) as u32)
+                .clamp(1_000_000, 80_000_000);
+            let config = crate::h264::H264Config { target, width: width.max(16) & !1, height: height.max(16) & !1, fps: fps.clamp(1, 60), bitrate };
+            let started = tokio::task::spawn_blocking(move || crate::h264::H264Session::start(config)).await;
+            match started {
+                Ok(Ok(session)) => {
+                    let id = session.id();
+                    let previous = s.state.h264.lock().replace(session);
+                    if let Some(previous) = previous {
+                        tokio::task::spawn_blocking(move || drop(previous));
+                    }
+                    Ok(serde_json::json!({
+                        "started": true, "codec": "h264", "capture_id": id.to_string(),
+                        "width": config.width, "height": config.height, "fps": config.fps, "bitrate": config.bitrate,
+                    }))
+                }
+                Ok(Err(error)) => {
+                    let text = error.to_string();
+                    let reason = if text.contains("permission") { "permission".to_string() } else { text };
+                    Err((StatusCode::SERVICE_UNAVAILABLE, reason))
+                }
+                Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("h264 worker failed: {error}"))),
+            }
+        }
+    };
+    let mut res = match outcome {
+        Ok(body) => Json(body).into_response(),
+        Err((status, error)) => (status, Json(serde_json::json!({"error": error}))).into_response(),
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+/// One frame on the wire: big-endian `u32` length of the payload, `u64`
+/// presentation time in microseconds, one flag byte (bit 0 = keyframe), then
+/// the Annex-B access unit. The stream opens on a keyframe and, after a
+/// reader falls behind, resumes on the next one.
+const H264_FRAME_HEADER: usize = 13;
+
+async fn capture_h264(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let subscription = s.state.h264.lock().as_ref().map(|session| (session.id(), session.subscribe()));
+    let Some((capture_id, mut frames)) = subscription else {
+        let mut res = (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "idle"}))).into_response();
+        apply_cors(&s.state, &headers, res.headers_mut());
+        return with_no_store(res);
+    };
+    let state = s.state.clone();
+    let stream = async_stream::stream! {
+        let mut synced = false;
+        loop {
+            let frame = match frames.recv().await {
+                Ok(frame) => frame,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    synced = false;
+                    if let Some(session) = state.h264.lock().as_ref() {
+                        if session.id() == capture_id { drop(session.subscribe()); }
+                    }
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if !synced {
+                if !frame.keyframe { continue; }
+                synced = true;
+            }
+            let mut packet = Vec::with_capacity(H264_FRAME_HEADER + frame.data.len());
+            packet.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
+            packet.extend_from_slice(&frame.pts_us.to_be_bytes());
+            packet.push(u8::from(frame.keyframe));
+            packet.extend_from_slice(&frame.data);
+            yield Ok::<_, Infallible>(axum::body::Bytes::from(packet));
+        }
+    };
+    let mut res = axum::body::Body::from_stream(stream).into_response();
+    res.headers_mut().insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
@@ -1276,7 +1408,7 @@ async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
         apply_cors(&s.state, &headers, res.headers_mut());
         return with_no_store(res);
     }
-    if s.state.capture.lock().is_none() {
+    if s.state.capture.lock().is_none() && s.state.h264.lock().is_none() {
         let mut res = (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "idle"})),
@@ -1295,7 +1427,7 @@ async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
         let mut pending: Vec<i16> = Vec::new();
         loop {
             // Session stopped mid-stream: end the body (clean EOF).
-            if state.capture.lock().is_none() {
+            if state.capture.lock().is_none() && state.h264.lock().is_none() {
                 break;
             }
             let audio = state.audio.lock().clone();
@@ -1413,6 +1545,7 @@ mod tests {
                 allowed_origins: origins.iter().map(|s| s.to_string()).collect(),
                 caps: crate::status::CapabilityFlags::default(),
                 capture: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                h264: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 audio: std::sync::Arc::new(
                     parking_lot::Mutex::new(crate::audio::AudioState::new()),
                 ),
@@ -1506,6 +1639,7 @@ mod tests {
         assert_eq!(v["name"], "jlocal");
         assert_eq!(v["capabilities"]["screen"]["available"], false);
         assert_eq!(v["capabilities"]["screen"]["capture"], true);
+        assert_eq!(v["capabilities"]["screen"]["h264"], cfg!(target_os = "macos"));
         assert_eq!(v["capabilities"]["screen"]["maxWidth"], 3840);
         assert_eq!(v["capabilities"]["screen"]["maxHeight"], 2160);
         assert_eq!(v["capabilities"]["screen"]["maxFps"], 60);

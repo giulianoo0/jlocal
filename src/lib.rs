@@ -6,6 +6,7 @@ pub mod api;
 pub mod audio;
 pub mod audio_engine;
 pub mod capture;
+pub mod h264;
 pub mod permissions;
 pub mod publish;
 pub mod status;
