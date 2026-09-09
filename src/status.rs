@@ -11,10 +11,13 @@ pub const DEFAULT_PORT: u16 = 40392;
 /// Origins the browser UI may probe us from. Used when
 /// `JLOCAL_ALLOWED_ORIGINS` is unset so a fresh install just works;
 /// setting the env replaces this list entirely.
-const DEFAULT_ORIGINS: [&str; 3] = [
+const DEFAULT_ORIGINS: [&str; 5] = [
     "https://juntos.lol",
     "https://www.juntos.lol",
     "https://beta.juntos.lol",
+    // The site's own dev server, so a local checkout sees the companion.
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ];
 
 fn parse_origins(raw: &str) -> Vec<String> {

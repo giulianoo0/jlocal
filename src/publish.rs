@@ -1,34 +1,26 @@
 //! Best-effort MoQ publish of the local screen to the Cloudflare relay.
 //!
-//! # Verdict: STUB (no interoperable Rust transport, September 2026)
+//! # Status: STUB with a pinned wire contract (September 2026)
 //!
-//! The web publisher (`web/src/screenshare.ts`, `@moq/publish 0.4.6` over
-//! `@moq/net 0.3.4`) negotiates **draft-ietf-moq-transport-16** with the relay
-//! this deployment configures (`MOQ_RELAY_URL=https://draft-16.…`, i.e. ALPN
-//! `moqt-16`, SETUP version `0xff000010`, pre-17 QUIC varints, control-stream
-//! multiplexing). The evaluated Rust crates do not speak that draft:
-//!
-//! - `moqtail` is Draft-18 compliant (ALPN `moqt-18`, version `0xff000012`,
-//!   leading-ones varints, native-bidi control). ALPN mismatch means the
-//!   draft-16 relay never negotiates a session. No interop.
-//! - `moq-transport` (moq-dev/moq Rust) now implements moq-lite; no version
-//!   could be pinned to draft-16 from this environment, and no single crate
-//!   bundles the WebTransport (HTTP/3 CONNECT) client + hang catalog + LOC
-//!   framing the relay path needs. No interop without hand-rolling draft-16.
-//!
-//! A native draft-16 transport would also strand us on a dead draft while the
-//! JS lib floats across drafts 14–20, so the recommended fallback is loopback
-//! fMP4 served by jlocal plus browser-side republish through the existing
-//! `publishScreen` graph (which already owns WebCodecs, WebTransport, and the
-//! relay tokens). See [`PublishSession`] for the slot-in point.
+//! The relay this deployment uses (`MOQ_RELAY_URL=https://draft-16.…`) speaks
+//! draft-ietf-moq-transport-14 and -16, and the Rust side of the same
+//! monorepo the web publisher comes from (moq-dev/moq: `moq-net` with
+//! `Version::Ietf(Draft16)`, `moq-native` for WebTransport over quinn, `hang`
+//! for the catalog and containers) speaks draft-16 too. The transport is
+//! therefore buildable; what is missing is the encoder pipeline (hardware
+//! H.264 at 4K60 + Opus) and the wiring. `rs/hang/examples/video.rs` in that
+//! repo is the publisher shape to copy. Until it lands every `push_*` fails
+//! and the `screen.available` capability flag MUST stay `false`.
 //!
 //! # Wire contract this module pins (byte-compatible with the web publisher)
 //!
 //! When a transport lands, the session MUST reproduce exactly what
 //! `@moq/publish` emits, or existing `@moq/watch` viewers break:
 //!
-//! - Broadcast path: `juntos/<room>/<secret>.hang` (server builds it in
-//!   `ScreenBroadcastPath`; the `.hang` suffix selects the hang catalog).
+//! - Broadcast path: `juntos/<room>/<secret>/<member>.hang` (server builds
+//!   the base in `ScreenBroadcastBase`, the web adds `/<member>.hang` in
+//!   `screenPath`; the `.hang` suffix selects the hang catalog). One broadcast
+//!   per publishing member, since several members may share at once.
 //! - Tracks inside the broadcast: [`CATALOG_TRACK`] (`catalog.json`), its
 //!   DEFLATE sibling [`CATALOG_TRACK_COMPRESSED`] (`catalog.json.z`),
 //!   [`VIDEO_TRACK`] (`video`), [`AUDIO_TRACK`] (`audio`).
@@ -36,9 +28,11 @@
 //!   codedWidth, codedHeight, framerate, bitrate } } },
 //!   audio: { renditions: { audio: { codec: "opus", container, sampleRate,
 //!   numberOfChannels, bitrate } } } }` (see [`catalog_json`]).
-//! - Media framing: LOC (`draft-ietf-moq-loc-04`): a property block carrying
-//!   the `0x10` timestamp in microseconds followed by the codec bitstream;
-//!   keyframes start a new group. Video codec is a WebCodecs string negotiated
+//! - Media framing: the hang `legacy` container, which is what
+//!   `@moq/publish` 0.4.6 emits and `@moq/watch` 0.5.3 consumes: a varint
+//!   timestamp in microseconds followed by the codec bitstream; keyframes
+//!   start a new group. (LOC exists on both sides but is not what viewers
+//!   read today.) Video codec is a WebCodecs string negotiated
 //!   by the browser encoder (e.g. `avc1.640028`); audio is Opus stereo at
 //!   [`SCREEN_AUDIO_BITRATE`] (160_000, music use, mirroring the web default).
 //! - Auth: the publish token is path-appended to the relay URL
@@ -83,12 +77,13 @@ pub const VIDEO_TRACK: &str = "video";
 /// `kind: 'music'`.
 pub const AUDIO_TRACK: &str = "audio";
 
-/// Container label the catalog assigns to LOC-framed renditions.
-/// One of the known `@moq/hang` container kinds (`legacy`, `cmaf`, `loc`).
-pub const CONTAINER_LOC: &str = "loc";
-/// Error text returned by every network path until a draft-16 transport lands.
+/// Container label the catalog assigns to the renditions: the `legacy`
+/// framing `@moq/publish` emits today. One of the known `@moq/hang` kinds
+/// (`legacy`, `cmaf`, `loc`).
+pub const CONTAINER: &str = "legacy";
+/// Error text returned by every network path until the transport lands.
 pub const TRANSPORT_UNAVAILABLE: &str =
-    "moq publish unavailable: no draft-ietf-moq-transport-16 Rust transport (see publish.rs verdict)";
+    "moq publish unavailable: draft-ietf-moq-transport-16 publisher not wired yet (see publish.rs)";
 
 /// Cumulative publish totals. All counters are monotonic; diff over an
 /// interval for rates. All zero while the transport is a stub.
@@ -133,10 +128,10 @@ pub struct AudioRendition {
     pub bitrate: Option<u32>,
 }
 
-/// Builds the broadcast path for a room, mirroring `ScreenBroadcastPath`:
-/// `juntos/<room>/<secret>.hang`.
-pub fn broadcast_path(room_id: &str, secret: &str) -> String {
-    format!("juntos/{room_id}/{secret}{BROADCAST_SUFFIX}")
+/// Builds one member's broadcast path, mirroring `ScreenBroadcastBase` +
+/// the web's `screenPath`: `juntos/<room>/<secret>/<member>.hang`.
+pub fn broadcast_path(room_id: &str, secret: &str, member_id: &str) -> String {
+    format!("juntos/{room_id}/{secret}/{member_id}{BROADCAST_SUFFIX}")
 }
 
 /// Builds the hang catalog JSON the viewers' `@moq/watch` parses: rendition
@@ -150,9 +145,9 @@ pub fn catalog_json(
     video_bitrate: u32,
 ) -> serde_json::Value {
     let mut video_container = BTreeMap::new();
-    video_container.insert("kind".to_string(), CONTAINER_LOC.to_string());
+    video_container.insert("kind".to_string(), CONTAINER.to_string());
     let mut audio_container = BTreeMap::new();
-    audio_container.insert("kind".to_string(), CONTAINER_LOC.to_string());
+    audio_container.insert("kind".to_string(), CONTAINER.to_string());
     let mut video_renditions = serde_json::Map::new();
     video_renditions.insert(
         VIDEO_TRACK.to_string(),
@@ -184,7 +179,7 @@ pub fn catalog_json(
     })
 }
 
-/// Guards the LOC timestamp invariant (microseconds, monotonic per track):
+/// Guards the frame timestamp invariant (microseconds, monotonic per track):
 /// viewers compute jitter from these, so a regression corrupts A/V sync.
 /// Returns the timestamp to publish (unchanged); errors on regression.
 #[derive(Clone, Copy, Debug, Default)]
@@ -250,7 +245,7 @@ impl PublishSession {
     }
 
     /// Publishes one H.264 Annex-B frame with its presentation timestamp in
-    /// microseconds. Keyframes MUST start a new group under LOC; the future
+    /// microseconds. Keyframes MUST start a new group; the future
     /// transport takes that from `keyframe`.
     pub fn push_video(
         &mut self,
@@ -314,10 +309,10 @@ mod tests {
     fn broadcast_path_matches_server() {
         // Mirrors ScreenBroadcastPath in internal/httpapi/screenshare.go.
         assert_eq!(
-            broadcast_path("room1", "s3cret"),
-            "juntos/room1/s3cret.hang"
+            broadcast_path("room1", "s3cret", "m1"),
+            "juntos/room1/s3cret/m1.hang"
         );
-        assert!(broadcast_path("r", "s").ends_with(BROADCAST_SUFFIX));
+        assert!(broadcast_path("r", "s", "m").ends_with(BROADCAST_SUFFIX));
     }
 
     #[test]
@@ -325,13 +320,13 @@ mod tests {
         let catalog = catalog_json("avc1.640028", 1920, 1080, 30, 2_000_000);
         let video = &catalog["video"]["renditions"]["video"];
         assert_eq!(video["codec"], "avc1.640028");
-        assert_eq!(video["container"]["kind"], "loc");
+        assert_eq!(video["container"]["kind"], "legacy");
         assert_eq!(video["codedWidth"], 1920);
         assert_eq!(video["codedHeight"], 1080);
         assert_eq!(video["framerate"], 30);
         let audio = &catalog["audio"]["renditions"]["audio"];
         assert_eq!(audio["codec"], "opus");
-        assert_eq!(audio["container"]["kind"], "loc");
+        assert_eq!(audio["container"]["kind"], "legacy");
         assert_eq!(audio["sampleRate"], 48_000);
         assert_eq!(audio["numberOfChannels"], 2);
         assert_eq!(audio["bitrate"], 160_000);
@@ -364,7 +359,7 @@ mod tests {
     fn connect_validates_endpoint_shape() {
         assert!(PublishSession::connect(
             "https://draft-16.cloudflare.mediaoverquic.com/tok",
-            "juntos/r/s.hang",
+            "juntos/r/s/m.hang",
             "tok",
         )
         .is_ok());
@@ -377,7 +372,7 @@ mod tests {
     fn pushes_fail_without_transport_close_is_idempotent() {
         let mut session = PublishSession::connect(
             "https://draft-16.cloudflare.mediaoverquic.com/tok",
-            "juntos/r/s.hang",
+            "juntos/r/s/m.hang",
             "tok",
         )
         .unwrap();
