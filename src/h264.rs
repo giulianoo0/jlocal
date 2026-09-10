@@ -297,7 +297,7 @@ mod platform {
     unsafe fn access_unit(sample: &CMSampleBuffer) -> Option<H264Frame> {
         // A sample without a NotSync attachment is a sync sample (keyframe).
         let keyframe = match sample.sample_attachments_array(false) {
-            Some(attachments) if attachments.len() > 0 => {
+            Some(attachments) if !attachments.is_empty() => {
                 let first = attachments.value_at_index(0) as *const CFDictionary<CFString, CFType>;
                 if first.is_null() {
                     true
@@ -579,6 +579,8 @@ mod platform {
     ) {
         objc2::rc::autoreleasepool(|_| {
             let (first_tx, first_rx) = std::sync::mpsc::channel();
+            // Lives on this thread only; the session handle inside is not Send.
+            #[allow(clippy::arc_with_non_send_sync)]
             let shared = Arc::new(Shared {
                 session: parking_lot::Mutex::new(None),
                 frames,
