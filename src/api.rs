@@ -665,7 +665,17 @@ async fn capture_start(
     let requested_display = capture_display_request(body_value);
     let requested_window = capture_window_request(body_value);
     if body_value.get("codec").and_then(|v| v.as_str()) == Some("h264") {
-        return h264_start(s, headers, body_value, width, height, fps, requested_display, requested_window).await;
+        return h264_start(
+            s,
+            headers,
+            body_value,
+            width,
+            height,
+            fps,
+            requested_display,
+            requested_window,
+        )
+        .await;
     }
     let prepared = tokio::task::spawn_blocking(
         move || -> Result<(crate::capture::CaptureSession, serde_json::Value), (StatusCode, String)> {
@@ -823,23 +833,46 @@ async fn h264_start(
     let target = match (display, window) {
         (DisplayRequest::Invalid, _) => Err("invalid display_id".to_string()),
         (_, WindowRequest::Invalid) => Err("invalid window_id".to_string()),
-        (DisplayRequest::Display(_), WindowRequest::Window(_)) => Err("only one of display_id, window_id".to_string()),
-        (DisplayRequest::Primary, WindowRequest::Absent) => Err("display_id or window_id required".to_string()),
-        (DisplayRequest::Display(id), WindowRequest::Absent) => Ok(crate::h264::H264Target::Display(id)),
-        (DisplayRequest::Primary, WindowRequest::Window(id)) => Ok(crate::h264::H264Target::Window(id)),
+        (DisplayRequest::Display(_), WindowRequest::Window(_)) => {
+            Err("only one of display_id, window_id".to_string())
+        }
+        (DisplayRequest::Primary, WindowRequest::Absent) => {
+            Err("display_id or window_id required".to_string())
+        }
+        (DisplayRequest::Display(id), WindowRequest::Absent) => {
+            Ok(crate::h264::H264Target::Display(id))
+        }
+        (DisplayRequest::Primary, WindowRequest::Window(id)) => {
+            Ok(crate::h264::H264Target::Window(id))
+        }
     };
     let outcome: Result<serde_json::Value, (StatusCode, String)> = match target {
         Err(error) => Err((StatusCode::BAD_REQUEST, error)),
-        Ok(_) if !crate::h264::H264Session::supported() => Err((StatusCode::NOT_IMPLEMENTED, "h264 capture is macOS only".to_string())),
+        Ok(_) if !crate::h264::H264Session::supported() => Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "h264 capture is macOS only".to_string(),
+        )),
         Ok(target) => {
             let bitrate = body
                 .get("bitrate")
                 .and_then(|v| v.as_u64())
                 .map(|b| b as u32)
-                .unwrap_or_else(|| (f64::from(width) * f64::from(height) * f64::from(fps.max(1)) * H264_BITS_PER_PIXEL_SECOND) as u32)
+                .unwrap_or_else(|| {
+                    (f64::from(width)
+                        * f64::from(height)
+                        * f64::from(fps.max(1))
+                        * H264_BITS_PER_PIXEL_SECOND) as u32
+                })
                 .clamp(1_000_000, 80_000_000);
-            let config = crate::h264::H264Config { target, width: width.max(16) & !1, height: height.max(16) & !1, fps: fps.clamp(1, 60), bitrate };
-            let started = tokio::task::spawn_blocking(move || crate::h264::H264Session::start(config)).await;
+            let config = crate::h264::H264Config {
+                target,
+                width: width.max(16) & !1,
+                height: height.max(16) & !1,
+                fps: fps.clamp(1, 60),
+                bitrate,
+            };
+            let started =
+                tokio::task::spawn_blocking(move || crate::h264::H264Session::start(config)).await;
             match started {
                 Ok(Ok(session)) => {
                     let id = session.id();
@@ -854,10 +887,17 @@ async fn h264_start(
                 }
                 Ok(Err(error)) => {
                     let text = error.to_string();
-                    let reason = if text.contains("permission") { "permission".to_string() } else { text };
+                    let reason = if text.contains("permission") {
+                        "permission".to_string()
+                    } else {
+                        text
+                    };
                     Err((StatusCode::SERVICE_UNAVAILABLE, reason))
                 }
-                Err(error) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("h264 worker failed: {error}"))),
+                Err(error) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("h264 worker failed: {error}"),
+                )),
             }
         }
     };
@@ -876,9 +916,18 @@ async fn h264_start(
 const H264_FRAME_HEADER: usize = 13;
 
 async fn capture_h264(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
-    let subscription = s.state.h264.lock().as_ref().map(|session| (session.id(), session.subscribe()));
+    let subscription = s
+        .state
+        .h264
+        .lock()
+        .as_ref()
+        .map(|session| (session.id(), session.subscribe()));
     let Some((capture_id, mut frames)) = subscription else {
-        let mut res = (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "idle"}))).into_response();
+        let mut res = (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "idle"})),
+        )
+            .into_response();
         apply_cors(&s.state, &headers, res.headers_mut());
         return with_no_store(res);
     };
@@ -910,7 +959,10 @@ async fn capture_h264(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
         }
     };
     let mut res = axum::body::Body::from_stream(stream).into_response();
-    res.headers_mut().insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    res.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
     apply_cors(&s.state, &headers, res.headers_mut());
     with_no_store(res)
 }
@@ -1459,7 +1511,11 @@ async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
                         let len = frame.samples.len();
                         let mixed = crate::audio_engine::mix_frames(&[frame], &audio);
                         // A muted mix still takes up its time.
-                        if mixed.is_empty() { vec![0; len] } else { mixed }
+                        if mixed.is_empty() {
+                            vec![0; len]
+                        } else {
+                            mixed
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         vec![0; crate::audio_engine::SAMPLES_PER_CHUNK]
@@ -1471,7 +1527,9 @@ async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
                 };
                 carry.extend(mixed);
                 while carry.len() >= crate::audio_engine::SAMPLES_PER_CHUNK {
-                    let chunk: Vec<i16> = carry.drain(..crate::audio_engine::SAMPLES_PER_CHUNK).collect();
+                    let chunk: Vec<i16> = carry
+                        .drain(..crate::audio_engine::SAMPLES_PER_CHUNK)
+                        .collect();
                     let bytes = axum::body::Bytes::from(crate::audio_engine::i16_to_bytes(&chunk));
                     // The reader is gone: nothing left to do here.
                     if chunks_tx.blocking_send(bytes).is_err() {
@@ -1685,7 +1743,10 @@ mod tests {
         assert_eq!(v["name"], "jlocal");
         assert_eq!(v["capabilities"]["screen"]["available"], false);
         assert_eq!(v["capabilities"]["screen"]["capture"], true);
-        assert_eq!(v["capabilities"]["screen"]["h264"], cfg!(target_os = "macos"));
+        assert_eq!(
+            v["capabilities"]["screen"]["h264"],
+            cfg!(target_os = "macos")
+        );
         assert_eq!(v["capabilities"]["screen"]["maxWidth"], 3840);
         assert_eq!(v["capabilities"]["screen"]["maxHeight"], 2160);
         assert_eq!(v["capabilities"]["screen"]["maxFps"], 60);

@@ -49,7 +49,10 @@ pub struct H264Session {
 
 impl std::fmt::Debug for H264Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("H264Session").field("id", &self.id).field("config", &self.config).finish()
+        f.debug_struct("H264Session")
+            .field("id", &self.id)
+            .field("config", &self.config)
+            .finish()
     }
 }
 
@@ -74,8 +77,19 @@ impl H264Session {
                 .spawn(move || platform::run(config, frames, stop, keyframe_wanted, ready_tx))?
         };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let session = Self { id, config, frames, stop, keyframe_wanted, worker: Some(worker), ready };
-        match session.ready.recv_timeout(std::time::Duration::from_secs(15)) {
+        let session = Self {
+            id,
+            config,
+            frames,
+            stop,
+            keyframe_wanted,
+            worker: Some(worker),
+            ready,
+        };
+        match session
+            .ready
+            .recv_timeout(std::time::Duration::from_secs(15))
+        {
             Ok(Ok(())) => Ok(session),
             Ok(Err(reason)) => anyhow::bail!("{reason}"),
             Err(_) => anyhow::bail!("h264 capture did not start in time"),
@@ -114,7 +128,9 @@ impl Drop for H264Session {
 /// parameter sets when asked. Pure, so it is testable without a GPU.
 pub fn annex_b(avcc: &[u8], header_len: usize, parameter_sets: &[&[u8]]) -> Vec<u8> {
     const START: [u8; 4] = [0, 0, 0, 1];
-    let mut out = Vec::with_capacity(avcc.len() + parameter_sets.iter().map(|p| p.len() + 4).sum::<usize>() + 16);
+    let mut out = Vec::with_capacity(
+        avcc.len() + parameter_sets.iter().map(|p| p.len() + 4).sum::<usize>() + 16,
+    );
     for set in parameter_sets {
         out.extend_from_slice(&START);
         out.extend_from_slice(set);
@@ -146,17 +162,19 @@ mod platform {
     use objc2::DefinedClass as _;
     use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
     use objc2_core_media::{
-        kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264, CMFormatDescription, CMSampleBuffer, CMTime,
-        CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
+        kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264, CMFormatDescription,
+        CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
     };
     use objc2_core_video::kCVPixelFormatType_32BGRA;
     use objc2_foundation::{NSArray, NSError};
     use objc2_screen_capture_kit::{
-        SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput, SCStreamOutputType,
+        SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamOutput,
+        SCStreamOutputType,
     };
     use objc2_video_toolbox::{
         kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-        kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+        kVTCompressionPropertyKey_ExpectedFrameRate,
+        kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
         kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
         kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_High_AutoLevel,
         kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
@@ -231,11 +249,20 @@ mod platform {
             CFDictionary::from_slices(&[key], &[yes])
         });
         let guard = shared.session.lock();
-        let Some(session) = guard.as_ref() else { return };
+        let Some(session) = guard.as_ref() else {
+            return;
+        };
         let mut flags = VTEncodeInfoFlags::empty();
         // SAFETY: session is alive under the lock; the buffer is valid for the call.
         let status = unsafe {
-            session.encode_frame(&image, pts, duration, props.as_deref().map(|d| d.as_opaque()), std::ptr::null_mut(), &mut flags)
+            session.encode_frame(
+                &image,
+                pts,
+                duration,
+                props.as_deref().map(|d| d.as_opaque()),
+                std::ptr::null_mut(),
+                &mut flags,
+            )
         };
         if status != 0 {
             tracing::debug!(status, "vt encode_frame refused a frame");
@@ -277,7 +304,10 @@ mod platform {
                 } else {
                     let key: &CFString = kCMSampleAttachmentKey_NotSync;
                     match (*first).get(key) {
-                        Some(value) => !value.downcast_ref::<CFBoolean>().map(CFBoolean::as_bool).unwrap_or(false),
+                        Some(value) => !value
+                            .downcast_ref::<CFBoolean>()
+                            .map(CFBoolean::as_bool)
+                            .unwrap_or(false),
                         None => true,
                     }
                 }
@@ -285,11 +315,21 @@ mod platform {
             _ => true,
         };
         let pts = sample.presentation_time_stamp();
-        let pts_us = if pts.timescale > 0 { (pts.value as i128 * 1_000_000 / pts.timescale as i128).max(0) as u64 } else { 0 };
+        let pts_us = if pts.timescale > 0 {
+            (pts.value as i128 * 1_000_000 / pts.timescale as i128).max(0) as u64
+        } else {
+            0
+        };
         let data = sample.data_buffer()?;
         let len = data.data_length();
         let mut avcc = vec![0u8; len];
-        if len == 0 || data.copy_data_bytes(0, len, NonNull::new_unchecked(avcc.as_mut_ptr() as *mut c_void)) != 0 {
+        if len == 0
+            || data.copy_data_bytes(
+                0,
+                len,
+                NonNull::new_unchecked(avcc.as_mut_ptr() as *mut c_void),
+            ) != 0
+        {
             return None;
         }
         let mut header_len = 4usize;
@@ -300,7 +340,11 @@ mod platform {
             }
         }
         let refs: Vec<&[u8]> = sets.iter().map(Vec::as_slice).collect();
-        Some(H264Frame { pts_us, keyframe, data: annex_b(&avcc, header_len, &refs) })
+        Some(H264Frame {
+            pts_us,
+            keyframe,
+            data: annex_b(&avcc, header_len, &refs),
+        })
     }
 
     unsafe fn parameter_sets(desc: &CMFormatDescription, header_len: &mut usize) -> Vec<Vec<u8>> {
@@ -309,14 +353,29 @@ mod platform {
         let mut nal_len: std::ffi::c_int = 4;
         let mut ptr: *const u8 = std::ptr::null();
         let mut size = 0usize;
-        if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(desc, 0, &mut ptr, &mut size, &mut count, &mut nal_len) != 0 {
+        if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            desc,
+            0,
+            &mut ptr,
+            &mut size,
+            &mut count,
+            &mut nal_len,
+        ) != 0
+        {
             return out;
         }
         *header_len = nal_len.max(1) as usize;
         for index in 0..count {
             let mut ptr: *const u8 = std::ptr::null();
             let mut size = 0usize;
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(desc, index, &mut ptr, &mut size, std::ptr::null_mut(), std::ptr::null_mut()) != 0
+            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                desc,
+                index,
+                &mut ptr,
+                &mut size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) != 0
                 || ptr.is_null()
             {
                 continue;
@@ -335,9 +394,14 @@ mod platform {
         Ok(())
     }
 
-    unsafe fn make_encoder(config: &H264Config, refcon: *mut c_void) -> anyhow::Result<CFRetained<VTCompressionSession>> {
-        let spec_key: &CFString = kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder;
-        let spec: CFRetained<CFDictionary<CFString, CFType>> = CFDictionary::from_slices(&[spec_key], &[CFBoolean::new(true).as_ref()]);
+    unsafe fn make_encoder(
+        config: &H264Config,
+        refcon: *mut c_void,
+    ) -> anyhow::Result<CFRetained<VTCompressionSession>> {
+        let spec_key: &CFString =
+            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder;
+        let spec: CFRetained<CFDictionary<CFString, CFType>> =
+            CFDictionary::from_slices(&[spec_key], &[CFBoolean::new(true).as_ref()]);
         let mut raw: *mut VTCompressionSession = std::ptr::null_mut();
         let status = VTCompressionSession::create(
             None,
@@ -356,12 +420,36 @@ mod platform {
         }
         let session = CFRetained::from_raw(NonNull::new_unchecked(raw));
         let s: &VTSession = session.as_ref();
-        set(s, kVTCompressionPropertyKey_RealTime, CFBoolean::new(true).as_ref())?;
-        set(s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel.as_ref())?;
-        set(s, kVTCompressionPropertyKey_AllowFrameReordering, CFBoolean::new(false).as_ref())?;
-        set(s, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, CFNumber::new_f64(2.0).as_ref())?;
-        set(s, kVTCompressionPropertyKey_ExpectedFrameRate, CFNumber::new_i32(config.fps as i32).as_ref())?;
-        set(s, kVTCompressionPropertyKey_AverageBitRate, CFNumber::new_i32(config.bitrate as i32).as_ref())?;
+        set(
+            s,
+            kVTCompressionPropertyKey_RealTime,
+            CFBoolean::new(true).as_ref(),
+        )?;
+        set(
+            s,
+            kVTCompressionPropertyKey_ProfileLevel,
+            kVTProfileLevel_H264_High_AutoLevel.as_ref(),
+        )?;
+        set(
+            s,
+            kVTCompressionPropertyKey_AllowFrameReordering,
+            CFBoolean::new(false).as_ref(),
+        )?;
+        set(
+            s,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+            CFNumber::new_f64(2.0).as_ref(),
+        )?;
+        set(
+            s,
+            kVTCompressionPropertyKey_ExpectedFrameRate,
+            CFNumber::new_i32(config.fps as i32).as_ref(),
+        )?;
+        set(
+            s,
+            kVTCompressionPropertyKey_AverageBitRate,
+            CFNumber::new_i32(config.bitrate as i32).as_ref(),
+        )?;
         let status = session.prepare_to_encode_frames();
         if status != 0 {
             anyhow::bail!("vt prepare refused ({status})");
@@ -395,10 +483,14 @@ mod platform {
             .map_err(|_| anyhow::anyhow!("timed out listing shareable content"))?
             .map_err(|e| anyhow::anyhow!("permission: {e}"))?;
         // SAFETY: retained above, reconstructed once.
-        unsafe { Retained::from_raw(raw) }.ok_or_else(|| anyhow::anyhow!("shareable content pointer was null"))
+        unsafe { Retained::from_raw(raw) }
+            .ok_or_else(|| anyhow::anyhow!("shareable content pointer was null"))
     }
 
-    unsafe fn build_filter(content: &SCShareableContent, target: H264Target) -> anyhow::Result<Retained<SCContentFilter>> {
+    unsafe fn build_filter(
+        content: &SCShareableContent,
+        target: H264Target,
+    ) -> anyhow::Result<Retained<SCContentFilter>> {
         match target {
             H264Target::Display(id) => {
                 let display = content
@@ -407,7 +499,11 @@ mod platform {
                     .find(|display| display.displayID() == id)
                     .ok_or_else(|| anyhow::anyhow!("display {id} not found"))?;
                 let empty = NSArray::<objc2_screen_capture_kit::SCWindow>::new();
-                Ok(SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &empty))
+                Ok(SCContentFilter::initWithDisplay_excludingWindows(
+                    SCContentFilter::alloc(),
+                    &display,
+                    &empty,
+                ))
             }
             H264Target::Window(id) => {
                 let window = content
@@ -415,7 +511,10 @@ mod platform {
                     .iter()
                     .find(|window| window.windowID() == id)
                     .ok_or_else(|| anyhow::anyhow!("window {id} not found"))?;
-                Ok(SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window))
+                Ok(SCContentFilter::initWithDesktopIndependentWindow(
+                    SCContentFilter::alloc(),
+                    &window,
+                ))
             }
         }
     }
@@ -434,13 +533,22 @@ mod platform {
         sc.setShowsCursor(true);
         sc.setQueueDepth(6);
         sc.setCapturesAudio(false);
-        let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), filter, &sc, None);
+        let stream =
+            SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), filter, &sc, None);
         stream
-            .addStreamOutput_type_sampleHandlerQueue_error(output, SCStreamOutputType::Screen, Some(&queue))
+            .addStreamOutput_type_sampleHandlerQueue_error(
+                output,
+                SCStreamOutputType::Screen,
+                Some(&queue),
+            )
             .map_err(|e| anyhow::anyhow!("SCStream video output refused: {e}"))?;
         let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
         let block: RcBlock<dyn Fn(*mut NSError)> = RcBlock::new(move |error: *mut NSError| {
-            let err = if error.is_null() { None } else { Some((&*error).localizedDescription().to_string()) };
+            let err = if error.is_null() {
+                None
+            } else {
+                Some((&*error).localizedDescription().to_string())
+            };
             let _ = tx.send(err);
         });
         stream.startCaptureWithCompletionHandler(Some(&block));
@@ -493,10 +601,12 @@ mod platform {
                     let content = shareable_content(Duration::from_secs(10))?;
                     let filter = build_filter(&content, config.target)?;
                     let output = VideoOutput::new(Arc::clone(&shared));
-                    let stream = start_stream(&filter, &config, ProtocolObject::from_ref(&*output))?;
+                    let stream =
+                        start_stream(&filter, &config, ProtocolObject::from_ref(&*output))?;
                     Ok((stream, output))
                 }
-            })();
+            })(
+            );
             let (stream, _output) = match outcome {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -508,7 +618,11 @@ mod platform {
                 }
             };
             let started = first_rx.recv_timeout(Duration::from_secs(10)).is_ok();
-            let _ = ready.send(if started { Ok(()) } else { Err("capture produced no frames".to_string()) });
+            let _ = ready.send(if started {
+                Ok(())
+            } else {
+                Err("capture produced no frames".to_string())
+            });
             if started {
                 while !stop.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(50));
@@ -560,7 +674,10 @@ mod tests {
         let out = annex_b(&avcc, 4, &[&sps, &pps]);
         assert_eq!(
             out,
-            vec![0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0, 0, 0, 1, 0x68, 0xEE, 0, 0, 0, 1, 0x65, 0xAA, 0, 0, 0, 1, 0x41]
+            vec![
+                0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0, 0, 0, 1, 0x68, 0xEE, 0, 0, 0, 1, 0x65, 0xAA,
+                0, 0, 0, 1, 0x41
+            ]
         );
     }
 
