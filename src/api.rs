@@ -1385,19 +1385,26 @@ async fn audio_mute(
     with_no_store(res)
 }
 
+/// How long the stream waits for the tap before sending silence instead:
+/// a tap that is still starting, or one the OS refused, keeps the browser
+/// fed, but a tap that is merely between buffers is never padded.
+const AUDIO_STARVE_WAIT: Duration = Duration::from_millis(200);
+
 /// System-audio mix as an infinite raw PCM body: `s16le`, 48 kHz, stereo,
-/// one [`crate::audio_engine::BYTES_PER_CHUNK`]-byte chunk per ~20 ms tick
+/// in [`crate::audio_engine::BYTES_PER_CHUNK`]-byte chunks
 /// (`Content-Type: audio/L16`). No framing headers, no container.
 ///
 /// - `501 {error}` where unwired (Linux).
 /// - `404 {error:"idle"}` with no capture session: the mix belongs to the
 ///   CURRENT session (starts/stops with it — the body ends when
 ///   `/capture/stop` lands).
-/// - Otherwise `200`: every tick drains the platform tap, mixes it with
-///   the LIVE [`crate::audio::AudioState`] (`all` = full mix, `none` =
-///   silence, `custom` = mix minus the muted set), and pads underflow with
-///   silence, so the browser `AudioContext` graph never starves — even when
-///   the tap itself is still starting or the OS refused it.
+/// - Otherwise `200`: the platform tap's frames go out as the OS captures
+///   them, mixed with the LIVE [`crate::audio::AudioState`] (`all` = full
+///   mix, `none` = silence, `custom` = mix minus the muted set). The
+///   stream is paced by the capture itself, not by a timer: a clock of our
+///   own drifted against the capture clock and had to pad or drop a few
+///   samples every tick to stay on it, which the ear heard as a constant
+///   flutter. Silence is sent only while the tap delivers nothing at all.
 async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     if !crate::audio_engine::capture_supported() {
         let mut res = (
@@ -1423,21 +1430,60 @@ async fn audio_stream(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
     let muted = s.state.audio.lock().muted_apps.clone();
     let _ = tokio::task::spawn_blocking(move || tap.lock().start(&muted)).await;
     let state = s.state.clone();
-    let stream = async_stream::stream! {
-        let mut pending: Vec<i16> = Vec::new();
-        loop {
-            // Session stopped mid-stream: end the body (clean EOF).
-            if state.capture.lock().is_none() && state.h264.lock().is_none() {
-                break;
+    // The wait for frames blocks, so it lives on a thread of its own; the
+    // body only forwards what that thread hands over.
+    let (chunks_tx, mut chunks_rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(64);
+    std::thread::Builder::new()
+        .name("jlocal-audio-stream".into())
+        .spawn(move || {
+            let mut receiver = None;
+            let mut carry: Vec<i16> = Vec::new();
+            loop {
+                // Session stopped mid-stream: end the body (clean EOF).
+                if state.capture.lock().is_none() && state.h264.lock().is_none() {
+                    break;
+                }
+                if receiver.is_none() {
+                    receiver = state.audio_tap.lock().receiver();
+                }
+                let received = match &receiver {
+                    Some(rx) => rx.recv_timeout(AUDIO_STARVE_WAIT),
+                    None => {
+                        std::thread::sleep(AUDIO_STARVE_WAIT);
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                    }
+                };
+                let mixed = match received {
+                    Ok(frame) => {
+                        let audio = state.audio.lock().clone();
+                        let len = frame.samples.len();
+                        let mixed = crate::audio_engine::mix_frames(&[frame], &audio);
+                        // A muted mix still takes up its time.
+                        if mixed.is_empty() { vec![0; len] } else { mixed }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        vec![0; crate::audio_engine::SAMPLES_PER_CHUNK]
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        receiver = None;
+                        continue;
+                    }
+                };
+                carry.extend(mixed);
+                while carry.len() >= crate::audio_engine::SAMPLES_PER_CHUNK {
+                    let chunk: Vec<i16> = carry.drain(..crate::audio_engine::SAMPLES_PER_CHUNK).collect();
+                    let bytes = axum::body::Bytes::from(crate::audio_engine::i16_to_bytes(&chunk));
+                    // The reader is gone: nothing left to do here.
+                    if chunks_tx.blocking_send(bytes).is_err() {
+                        return;
+                    }
+                }
             }
-            let audio = state.audio.lock().clone();
-            let mixed =
-                crate::audio_engine::mix_frames(&state.audio_tap.lock().drain_frames(), &audio);
-            let bytes = crate::audio_engine::push_tick(&mut pending, mixed);
-            yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::copy_from_slice(
-                &bytes,
-            ));
-            tokio::time::sleep(crate::audio_engine::FRAME_INTERVAL).await;
+        })
+        .ok();
+    let stream = async_stream::stream! {
+        while let Some(bytes) = chunks_rx.recv().await {
+            yield Ok::<_, std::convert::Infallible>(bytes);
         }
     };
     let mut res = axum::body::Body::from_stream(stream).into_response();

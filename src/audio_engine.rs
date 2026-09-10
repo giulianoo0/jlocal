@@ -283,6 +283,14 @@ impl AudioTap {
         platform_set_excluded(self, muted);
     }
 
+    /// A receive end of the tap's frames, for a stream that waits on them
+    /// rather than polling on a clock: every frame goes out as the OS
+    /// delivered it, at the rate it was captured. `None` while idle; the
+    /// channel disconnects when the tap stops.
+    pub fn receiver(&self) -> Option<crossbeam_channel::Receiver<AppFrame>> {
+        self.inner.lock().frames_rx.clone()
+    }
+
     /// Drain freshly captured frames (non-blocking, capped so one slow HTTP
     /// tick can't pile up unbounded work). Empty while idle or starved —
     /// the caller pads with silence.
