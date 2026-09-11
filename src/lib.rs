@@ -12,3 +12,4 @@ pub mod publish;
 pub mod status;
 pub mod torrent;
 pub mod update;
+pub mod youtube;

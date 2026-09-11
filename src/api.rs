@@ -12,6 +12,11 @@
 //! - `POST /capture/start` -> { started, display_id|window_id, width, height, fps }
 //! - `POST /capture/stop`  -> { stopped: true }
 //! - `GET /capture/snapshot` -> one-frame JPEG (`?display_id=<id|empty=primary>` xor `?window_id=<id>`, `&width=<px>`)
+//! - `GET /youtube/tools`  -> { status, done?, total?, error? } (pinned yt-dlp + FFmpeg in the data dir)
+//! - `POST /youtube/tools` -> starts the download; same body as GET
+//! - `POST /youtube/resolve` -> { url } → { summary } or { error, detail }
+//! - `POST /youtube/run`   -> { url, runId, claim, roomId, mediaGeneration, region, startMs, apiBase } → { runId }
+//! - `GET /youtube/run/:id`, `DELETE /youtube/run/:id`
 //!
 //! Security: Host must be loopback (DNS-rebinding guard); CORS only echoes
 //! allowlisted origins (`JLOCAL_ALLOWED_ORIGINS`); everything is `no-store`.
@@ -60,7 +65,16 @@ struct CapabilitiesBody {
     screen: ScreenCapabilities,
     audio: AudioCapabilities,
     torrent: TorrentCapabilities,
+    youtube: YoutubeCapabilities,
     permissions: PermissionCapabilities,
+}
+
+#[derive(Serialize)]
+struct YoutubeCapabilities {
+    /// Tools present: links can be resolved and prepared here.
+    available: bool,
+    /// `ready`, `missing`, `downloading`, `failed` or `unsupported`.
+    tools: &'static str,
 }
 #[derive(Serialize)]
 struct ScreenCapabilities {
@@ -117,6 +131,16 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/torrent/select", post(torrent_select))
         .route("/torrent/stats/:id", get(torrent_stats))
         .route("/torrent/:id", delete(torrent_remove))
+        .route(
+            "/youtube/tools",
+            get(youtube_tools).post(youtube_tools_install),
+        )
+        .route("/youtube/resolve", post(youtube_resolve))
+        .route("/youtube/run", post(youtube_run))
+        .route(
+            "/youtube/run/:id",
+            get(youtube_run_status).delete(youtube_run_cancel),
+        )
         .route("/health", axum::routing::options(preflight))
         .route("/version", axum::routing::options(preflight))
         .route("/events", axum::routing::options(preflight))
@@ -139,6 +163,10 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/torrent/select", axum::routing::options(preflight))
         .route("/torrent/stats/:id", axum::routing::options(preflight))
         .route("/torrent/:id", axum::routing::options(preflight))
+        .route("/youtube/tools", axum::routing::options(preflight))
+        .route("/youtube/resolve", axum::routing::options(preflight))
+        .route("/youtube/run", axum::routing::options(preflight))
+        .route("/youtube/run/:id", axum::routing::options(preflight))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_loopback_host,
@@ -234,6 +262,16 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
             },
             torrent: TorrentCapabilities {
                 available: s.state.caps.torrent,
+            },
+            youtube: YoutubeCapabilities {
+                available: s.state.youtube.ready(),
+                tools: match s.state.youtube.status() {
+                    crate::youtube::ToolsStatus::Ready => "ready",
+                    crate::youtube::ToolsStatus::Missing => "missing",
+                    crate::youtube::ToolsStatus::Downloading { .. } => "downloading",
+                    crate::youtube::ToolsStatus::Failed { .. } => "failed",
+                    crate::youtube::ToolsStatus::Unsupported => "unsupported",
+                },
             },
             permissions: PermissionCapabilities {
                 // Live probe, report-only: never prompts, so reading it per
@@ -1112,6 +1150,157 @@ async fn torrent_add(
     with_no_store(res)
 }
 
+fn tools_body(status: crate::youtube::ToolsStatus) -> serde_json::Value {
+    serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({"status": "failed"}))
+}
+
+async fn youtube_tools(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let mut res = Json(tools_body(s.state.youtube.status())).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_tools_install(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
+    let status = s.state.youtube.start_install();
+    let code = match status {
+        crate::youtube::ToolsStatus::Unsupported => StatusCode::NOT_IMPLEMENTED,
+        _ => StatusCode::ACCEPTED,
+    };
+    let mut res = (code, Json(tools_body(status))).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+fn youtube_unavailable(status: &crate::youtube::ToolsStatus) -> Response {
+    let code = match status {
+        crate::youtube::ToolsStatus::Unsupported => "unsupported",
+        _ => "tools_missing",
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": code, "tools": tools_body(status.clone())})),
+    )
+        .into_response()
+}
+
+async fn youtube_resolve(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let url = body
+        .as_ref()
+        .and_then(|b| b.0.get("url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut res = if url.is_empty()
+        || url.len() > 2048
+        || !(url.starts_with("https://") || url.starts_with("http://"))
+    {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid_url"})),
+        )
+            .into_response()
+    } else if !s.state.youtube.ready() {
+        youtube_unavailable(&s.state.youtube.status())
+    } else {
+        match s.state.youtube.resolve(&url).await {
+            Ok(summary) => Json(serde_json::json!({"summary": summary})).into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": e.code(), "detail": e.detail()})),
+            )
+                .into_response(),
+        }
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_run(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let parsed = body
+        .map(|b| serde_json::from_value::<crate::youtube::RunRequest>(b.0))
+        .transpose();
+    let mut res = match parsed {
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request", "detail": e.to_string()})),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request"})),
+        )
+            .into_response(),
+        Ok(Some(req)) if !s.state.youtube.ready() => {
+            let _ = req;
+            youtube_unavailable(&s.state.youtube.status())
+        }
+        Ok(Some(req)) => {
+            let run_id = req.run_id.clone();
+            match s.state.youtube.run(req).await {
+                Ok(()) => (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({"runId": run_id})),
+                )
+                    .into_response(),
+                Err(e) => {
+                    let code = e.to_string();
+                    let status = if code == "remux_busy" {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    (status, Json(serde_json::json!({"error": code}))).into_response()
+                }
+            }
+        }
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_run_status(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mut res = match s.state.youtube.run_status(&id).await {
+        Some(status) => Json(serde_json::json!({
+            "runId": id,
+            "state": status.state,
+            "producedMs": status.produced_ms,
+            "error": status.error,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown_run"})),
+        )
+            .into_response(),
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_run_cancel(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cancelled = s.state.youtube.cancel(&id).await;
+    let mut res = Json(serde_json::json!({"cancelled": cancelled})).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
 async fn torrent_list(State(s): State<ApiState>, headers: HeaderMap) -> impl IntoResponse {
     let mut res = match s.state.torrent.clone() {
         Some(manager) => Json(serde_json::json!({"torrents": manager.list()})).into_response(),
@@ -1660,6 +1849,7 @@ mod tests {
                 update: std::sync::Arc::new(parking_lot::Mutex::new(
                     crate::update::UpdateState::default(),
                 )),
+                youtube: crate::youtube::Youtube::new(),
             },
             port: 40392,
         }

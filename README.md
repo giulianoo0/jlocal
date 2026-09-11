@@ -59,6 +59,12 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `POST /torrent/select` | `{selected:true}` (focuses the swarm on one file)             |
 | `GET /torrent/stats/{id}` | `{peers,downBps,downloaded,progress}`                       |
 | `DELETE /torrent/{id}` | `{removed:true}` (refuses metadata-less torrents: retry later) |
+| `GET /youtube/tools` | `{status}`: `ready`, `missing`, `downloading` (+`done`,`total` bytes), `failed` (+`error`) or `unsupported`. yt-dlp and FFmpeg are not in the bundle: they are fetched once into `~/Library/Application Support/jlocal/tools` (macOS) or `%LOCALAPPDATA%\jlocal\tools` (Windows), pinned by sha256 |
+| `POST /youtube/tools` | starts the download; `202` with the same body, `501` where no tools are pinned |
+| `POST /youtube/resolve` | `{url}` → `{summary}` (title, duration, chosen video/audio/subtitle tracks, no CDN urls) or `502 {error, detail}` with the site's codes (`youtube_blocked`, `youtube_unavailable`, `youtube_unsupported`, `youtube_tool`); `503 {error:"tools_missing"}` before the download |
+| `POST /youtube/run` | `{url, runId, claim, roomId, mediaGeneration, region, startMs, apiBase}` → `202 {runId}`: prepares the video with the fleet's `ss-remux` crate and publishes into the room through `apiBase` under `claim`; a new run for the same room supersedes the previous one (that is how a seek arrives) |
+| `GET /youtube/run/{id}` | `{runId, state, producedMs, error}`; `404 {error:"unknown_run"}` |
+| `DELETE /youtube/run/{id}` | `{cancelled}` |
 
 Security: `Host` must be loopback (DNS-rebinding guard); CORS echoes
 allowlisted origins (`Access-Control-Allow-Origin` + Vary) on every endpoint

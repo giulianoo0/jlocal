@@ -86,6 +86,9 @@ pub struct AppState {
     /// Self-update status: the background poller records the newest newer
     /// tag here; the window title and tray menu read it.
     pub update: std::sync::Arc<parking_lot::Mutex<crate::update::UpdateState>>,
+    /// YouTube links prepared here: pinned tools in the data dir, the
+    /// fleet's remux crate behind them.
+    pub youtube: std::sync::Arc<crate::youtube::Youtube>,
 }
 
 impl AppState {
@@ -118,6 +121,7 @@ impl AppState {
             update: std::sync::Arc::new(parking_lot::Mutex::new(
                 crate::update::UpdateState::default(),
             )),
+            youtube: crate::youtube::Youtube::new(),
         }
     }
 }

@@ -30,6 +30,12 @@ flate2 = "1"
 crossbeam-channel = "0.5"
 softbuffer = "0.4"
 fontdue = "0.9"
+futures = "0.3"
+hex = "0.4"
+sha2 = "0.10"
+zip = "2"
+# The remux the fleet runs, so a link is prepared here exactly as there.
+ss-remux = { git = "https://github.com/giulianoo0/juntos.lol", branch = "main" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -56,9 +62,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ]}
 windows-core = "0.62"
-
-[target.'cfg(windows)'.dependencies]
-zip = "2"
 
 [profile.release]
 opt-level = 2
