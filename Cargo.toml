@@ -36,6 +36,7 @@ sha2 = "0.10"
 zip = "2"
 # The remux the fleet runs, so a link is prepared here exactly as there.
 ss-remux = { git = "https://github.com/giulianoo0/juntos.lol", branch = "main" }
+rustls-native-certs = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

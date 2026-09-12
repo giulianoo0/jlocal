@@ -75,6 +75,8 @@ struct YoutubeCapabilities {
     available: bool,
     /// `ready`, `missing`, `downloading`, `failed` or `unsupported`.
     tools: &'static str,
+    /// Lives can be put on the relay from here (tools present).
+    live: bool,
 }
 #[derive(Serialize)]
 struct ScreenCapabilities {
@@ -137,6 +139,11 @@ pub fn router(state: AppState, port: u16) -> Router {
         )
         .route("/youtube/resolve", post(youtube_resolve))
         .route("/youtube/run", post(youtube_run))
+        .route("/youtube/live/start", post(youtube_live_start))
+        .route(
+            "/youtube/live/:room",
+            get(youtube_live_state).delete(youtube_live_stop),
+        )
         .route(
             "/youtube/run/:id",
             get(youtube_run_status).delete(youtube_run_cancel),
@@ -166,6 +173,8 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/youtube/tools", axum::routing::options(preflight))
         .route("/youtube/resolve", axum::routing::options(preflight))
         .route("/youtube/run", axum::routing::options(preflight))
+        .route("/youtube/live/start", axum::routing::options(preflight))
+        .route("/youtube/live/:room", axum::routing::options(preflight))
         .route("/youtube/run/:id", axum::routing::options(preflight))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -182,6 +191,16 @@ struct ApiState {
 
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
+    // A live whose tab went away without a word is stopped here, not only
+    // when the next request happens to look.
+    let youtube = state.youtube.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            youtube.reap_orphans().await;
+        }
+    });
     let app = router(state, port);
     axum::serve(listener, app).await?;
     Ok(())
@@ -272,6 +291,7 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
                     crate::youtube::ToolsStatus::Failed { .. } => "failed",
                     crate::youtube::ToolsStatus::Unsupported => "unsupported",
                 },
+                live: s.state.youtube.ready(),
             },
             permissions: PermissionCapabilities {
                 // Live probe, report-only: never prompts, so reading it per
@@ -2630,4 +2650,72 @@ mod tests {
         };
         assert_eq!(error, expected);
     }
+}
+
+async fn youtube_live_start(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let parsed = body
+        .map(|b| serde_json::from_value::<crate::youtube::LiveRequest>(b.0))
+        .transpose();
+    let mut res = match parsed {
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request", "detail": e.to_string()})),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request"})),
+        )
+            .into_response(),
+        Ok(Some(req)) if !s.state.youtube.ready() => {
+            let _ = req;
+            youtube_unavailable(&s.state.youtube.status())
+        }
+        Ok(Some(req)) => match s.state.youtube.live_start(req).await {
+            Ok(()) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
+            Err(e) => {
+                let code = e.to_string();
+                let status = if code == "live_busy" {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                (status, Json(serde_json::json!({"error": code}))).into_response()
+            }
+        },
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_live_state(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+) -> impl IntoResponse {
+    let mut res = match s.state.youtube.live_state(&room).await {
+        Some(state) => Json(serde_json::json!(state)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown_live"})),
+        )
+            .into_response(),
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_live_stop(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+) -> impl IntoResponse {
+    let stopped = s.state.youtube.live_stop(&room).await;
+    let mut res = Json(serde_json::json!({"stopped": stopped})).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
 }

@@ -160,6 +160,9 @@ pub struct Youtube {
     dir: PathBuf,
     status: Mutex<ToolsStatus>,
     remux: tokio::sync::Mutex<Option<Arc<ss_remux::Remux>>>,
+    /// When each room's live was last asked about: the host tab polls every
+    /// couple of seconds, so silence means the tab is gone and the live with it.
+    live_seen: Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl std::fmt::Debug for Youtube {
@@ -185,6 +188,7 @@ impl Youtube {
             dir,
             status: Mutex::new(status),
             remux: tokio::sync::Mutex::new(None),
+            live_seen: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -323,10 +327,12 @@ impl Youtube {
             object_bytes: 256 << 20,
             put_concurrency: 4,
             put_global: 8,
+            live_slots: 1,
             youtube: Some(ss_remux::youtube::Config {
                 ytdlp_path: self.tool("yt-dlp"),
                 proxy: None,
                 cookies_file: None,
+                ca_file: self.ca_bundle(),
             }),
         };
         let remux = ss_remux::Remux::new(cfg).await;
@@ -481,5 +487,130 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), "{\"set\":\"old\"}").unwrap();
         assert!(!Youtube::installed(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A live nobody asked about for this long has lost its tab.
+const LIVE_ORPHAN_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A live to put on the relay: the page, the relay URL carrying the publish
+/// token the site fetched, and the broadcast name the server assigned.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveRequest {
+    pub url: String,
+    pub relay: String,
+    pub broadcast: String,
+    pub room_id: String,
+}
+
+impl Youtube {
+    /// Stops every live whose tab has not asked about it for a while: a
+    /// host closing the browser leaves no other trace, and the slot must
+    /// come back.
+    async fn reap_lives(&self, remux: &ss_remux::Remux) {
+        let stale: Vec<String> = self
+            .live_seen
+            .lock()
+            .iter()
+            .filter(|(_, seen)| seen.elapsed() > LIVE_ORPHAN_AFTER)
+            .map(|(room, _)| room.clone())
+            .collect();
+        for room in stale {
+            tracing::info!(room, "live orphaned by its tab; stopping");
+            remux.stop_live(&room);
+            self.live_seen.lock().remove(&room);
+        }
+    }
+
+    /// The periodic sweep: nothing to do while no remux exists.
+    pub async fn reap_orphans(&self) {
+        let remux = self.remux.lock().await.clone();
+        if let Some(remux) = remux {
+            self.reap_lives(&remux).await;
+        }
+    }
+
+    pub async fn live_start(&self, req: LiveRequest) -> anyhow::Result<()> {
+        let remux = self.remux().await?;
+        self.reap_lives(&remux).await;
+        self.live_seen
+            .lock()
+            .insert(req.room_id.clone(), std::time::Instant::now());
+        remux
+            .start_live(
+                &req.room_id,
+                ss_remux::live::Request {
+                    url: req.url,
+                    relay: req.relay,
+                    broadcast: req.broadcast,
+                },
+            )
+            .map_err(|code| anyhow::anyhow!("{code}"))
+    }
+
+    pub async fn live_state(&self, room: &str) -> Option<ss_remux::live::State> {
+        let remux = self.remux.lock().await.clone()?;
+        if let Some(seen) = self.live_seen.lock().get_mut(room) {
+            *seen = std::time::Instant::now();
+        }
+        self.reap_lives(&remux).await;
+        remux.live_state(room)
+    }
+
+    pub async fn live_stop(&self, room: &str) -> bool {
+        self.live_seen.lock().remove(room);
+        let Some(remux) = self.remux.lock().await.clone() else {
+            return false;
+        };
+        remux.stop_live(room)
+    }
+}
+
+impl Youtube {
+    /// The system's trust roots as a PEM file for the static FFmpeg, which
+    /// carries none of its own: written once next to the tools, refreshed
+    /// after a month. None when nothing could be exported; FFmpeg then fails
+    /// verification and the site falls back to the fleet.
+    fn ca_bundle(&self) -> Option<std::path::PathBuf> {
+        let path = self.dir.join("ca.pem");
+        let fresh = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .map(|m| {
+                m.elapsed()
+                    .map(|age| age.as_secs() < 30 * 24 * 3600)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if fresh {
+            return Some(path);
+        }
+        use base64::Engine as _;
+        let mut pem = String::new();
+        let mut count = 0;
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+            pem.push_str("-----BEGIN CERTIFICATE-----\n");
+            for line in encoded.as_bytes().chunks(64) {
+                pem.push_str(std::str::from_utf8(line).unwrap_or(""));
+                pem.push('\n');
+            }
+            pem.push_str("-----END CERTIFICATE-----\n");
+            count += 1;
+        }
+        if count == 0 {
+            tracing::warn!("no system trust roots to hand ffmpeg");
+            return None;
+        }
+        match std::fs::write(&path, pem) {
+            Ok(()) => {
+                tracing::info!(roots = count, path = %path.display(), "trust roots written for ffmpeg");
+                Some(path)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not write the trust roots for ffmpeg");
+                None
+            }
+        }
     }
 }
