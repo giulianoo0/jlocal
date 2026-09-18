@@ -6379,7 +6379,7 @@ dependencies = [
 [[package]]
 name = "ss-remux"
 version = "0.1.0"
-source = "git+https://github.com/giulianoo0/juntos.lol?branch=main#1a2b9dbdf6a4ce251beba383ae45d76056ab04b3"
+source = "git+https://github.com/giulianoo0/juntos.lol?branch=main#7dc6050af2252dc28fd244a57c22fa834ed8b92d"
 dependencies = [
  "anyhow",
  "async-trait",
