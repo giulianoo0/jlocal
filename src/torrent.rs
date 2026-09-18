@@ -26,7 +26,12 @@
 //!   HTTP status is derivable. Handlers should try
 //!   `err.downcast_ref::<TorrentError>()` first, then fall back to `500`.
 use std::{
-    collections::HashSet, io::SeekFrom, ops::Range, path::PathBuf, str::FromStr, sync::Arc,
+    collections::HashSet,
+    io::SeekFrom,
+    ops::Range,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -40,6 +45,7 @@ use librqbit::{
 type ManagedTorrentHandle = std::sync::Arc<ManagedTorrent>;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncSeekExt};
+use tokio_util::sync::CancellationToken;
 
 /// How long `add_magnet` waits for magnet metadata (DHT + trackers) before
 /// giving up. DHT fetches usually resolve in seconds; 60s covers slow swarms
@@ -232,30 +238,45 @@ impl TorrentManager {
             .await
             .with_context(|| format!("error creating session state dir {}", state_dir.display()))?;
 
-        let listen = ListenerOptions {
-            // Explicit: never punch holes in the user's NAT for a loopback companion.
-            enable_upnp_port_forwarding: false,
-            ..Default::default()
+        let session = match Self::session(&dir, &state_dir, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("jlocal: torrent session failed ({e:#}); retrying on a random DHT port");
+                Self::session(&dir, &state_dir, Some(0)).await?
+            }
         };
+        Ok(Self { session, dir })
+    }
 
-        // `dht: Some(..)` (on) and `disable_trackers: false` (on) are already
-        // the defaults; set explicitly so a future default change can't
-        // silently flip us.
+    /// `dht_port: Some(0)` skips the persisted DHT port, which another process
+    /// may hold; the random one is persisted in its place.
+    async fn session(
+        dir: &Path,
+        state_dir: &Path,
+        dht_port: Option<u16>,
+    ) -> anyhow::Result<Arc<Session>> {
+        let token = CancellationToken::new();
         let opts = SessionOptions {
-            dht: Some(librqbit::DhtSessionConfig::default()),
+            dht: Some(librqbit::DhtSessionConfig {
+                port: dht_port,
+                ..Default::default()
+            }),
             disable_trackers: false,
-            listen: Some(listen),
+            listen: Some(ListenerOptions {
+                enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
             fastresume: true,
             persistence: Some(SessionPersistenceConfig::Json {
-                folder: Some(state_dir),
+                folder: Some(state_dir.to_path_buf()),
             }),
+            cancellation_token: Some(token.clone()),
             ..Default::default()
         };
-
-        let session = Session::new_with_opts(dir.clone(), opts)
+        Session::new_with_opts(dir.to_path_buf(), opts)
             .await
-            .context("error creating torrent session")?;
-        Ok(Self { session, dir })
+            .inspect_err(|_| token.cancel())
+            .context("error creating torrent session")
     }
 
     /// Download/output root this manager was built with.

@@ -3005,6 +3005,7 @@ dependencies = [
  "tar",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
