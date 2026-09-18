@@ -59,6 +59,8 @@ jlocal --no-ui          # headless: API only (tray-less servers, CI)
 | `POST /torrent/select` | `{selected:true}` (focuses the swarm on one file)             |
 | `GET /torrent/stats/{id}` | `{peers,downBps,downloaded,progress}`                       |
 | `DELETE /torrent/{id}` | `{removed:true}` (refuses metadata-less torrents: retry later) |
+| `POST /torrent/run` | `{id, file, runId, claim, roomId, mediaGeneration, region, startMs, apiBase}` → `202 {runId}`: selects the file and remuxes it with `ss-remux` exactly as `/youtube/run`, reading through the fleet's piece window (a span around each reader, head and tail pinned, the whole file filled once the reader is quiet) |
+| `GET /torrent/run/{id}`, `DELETE /torrent/run/{id}` | as the YouTube run |
 | `GET /youtube/tools` | `{status}`: `ready`, `missing`, `downloading` (+`done`,`total` bytes), `failed` (+`error`) or `unsupported`. yt-dlp and FFmpeg are not in the bundle: they are fetched once into `~/Library/Application Support/jlocal/tools` (macOS) or `%LOCALAPPDATA%\jlocal\tools` (Windows), pinned by sha256 |
 | `POST /youtube/tools` | starts the download; `202` with the same body, `501` where no tools are pinned |
 | `POST /youtube/resolve` | `{url}` → `{summary}` (title, duration, chosen video/audio/subtitle tracks, no CDN urls) or `502 {error, detail}` with the site's codes (`youtube_blocked`, `youtube_unavailable`, `youtube_unsupported`, `youtube_tool`); `503 {error:"tools_missing"}` before the download |

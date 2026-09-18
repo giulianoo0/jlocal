@@ -140,11 +140,11 @@ struct Manifest {
     set: String,
 }
 
-/// What the site sends to start or replace a run for a room.
+/// Where and under which fence a run publishes; the site sends it with
+/// every region it starts.
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RunRequest {
-    pub url: String,
+pub struct RunTarget {
     pub run_id: String,
     pub claim: String,
     pub room_id: String,
@@ -156,10 +156,46 @@ pub struct RunRequest {
     pub api_base: String,
 }
 
+impl RunTarget {
+    fn spec(&self) -> anyhow::Result<ss_remux::protocol::Spec> {
+        Ok(serde_json::from_value(serde_json::json!({
+            "protocolVersion": ss_remux::protocol::PROTOCOL_VERSION,
+            "runId": self.run_id,
+            "claim": self.claim,
+            "mediaGeneration": self.media_generation,
+            "region": self.region,
+            "startMs": self.start_ms,
+            "apiBase": self.api_base.trim_end_matches('/'),
+            "roomId": self.room_id,
+        }))?)
+    }
+}
+
+/// What the site sends to start or replace a run for a room.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRequest {
+    pub url: String,
+    #[serde(flatten)]
+    pub target: RunTarget,
+}
+
+/// A torrent's file to prepare: the infohash and the file's index.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentRunRequest {
+    pub id: String,
+    pub file: usize,
+    #[serde(flatten)]
+    pub target: RunTarget,
+}
+
 pub struct Youtube {
     dir: PathBuf,
     status: Mutex<ToolsStatus>,
     remux: tokio::sync::Mutex<Option<Arc<ss_remux::Remux>>>,
+    /// The runs started here, oldest first, with their room.
+    started: Mutex<Vec<(String, String)>>,
     /// When each room's live was last asked about: the host tab polls every
     /// couple of seconds, so silence means the tab is gone and the live with it.
     live_seen: Mutex<std::collections::HashMap<String, std::time::Instant>>,
@@ -188,6 +224,7 @@ impl Youtube {
             dir,
             status: Mutex::new(status),
             remux: tokio::sync::Mutex::new(None),
+            started: Mutex::new(Vec::new()),
             live_seen: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -310,6 +347,8 @@ impl Youtube {
         Ok(())
     }
 
+    /// The one remux on this machine, for links and torrents alike; the
+    /// tools download brings its FFmpeg.
     async fn remux(&self) -> anyhow::Result<Arc<ss_remux::Remux>> {
         if !self.ready() {
             anyhow::bail!("tools_missing");
@@ -339,9 +378,6 @@ impl Youtube {
         if !remux.enabled() {
             anyhow::bail!("ffmpeg does not run");
         }
-        if remux.youtube.is_none() {
-            anyhow::bail!("yt-dlp does not run");
-        }
         *held = Some(remux.clone());
         Ok(remux)
     }
@@ -364,23 +400,61 @@ impl Youtube {
     /// Starts (or replaces, per room) a run; the crate cancels the room's
     /// previous run itself, which is how a seek arrives.
     pub async fn run(&self, req: RunRequest) -> anyhow::Result<()> {
+        let input = ss_remux::RunInput::Youtube(ss_remux::youtube::Request { url: req.url });
+        self.start(input, &req.target).await
+    }
+
+    /// A file of a torrent this machine holds, read through the window.
+    pub async fn run_torrent(
+        &self,
+        torrents: &crate::torrent::TorrentManager,
+        req: TorrentRunRequest,
+    ) -> anyhow::Result<()> {
+        let id = crate::torrent::parse_id_hex(&req.id)?.as_string();
+        torrents.select_file(&id, req.file).await?;
+        let source = ss_remux::torrent::TorrentSource::new(torrents.local(), &id, req.file)?;
+        let input = ss_remux::RunInput::Container(Arc::new(source));
+        self.start(input, &req.target).await
+    }
+
+    async fn start(&self, input: ss_remux::RunInput, target: &RunTarget) -> anyhow::Result<()> {
         let remux = self.remux().await?;
-        let spec: ss_remux::protocol::Spec = serde_json::from_value(serde_json::json!({
-            "protocolVersion": ss_remux::protocol::PROTOCOL_VERSION,
-            "runId": req.run_id,
-            "claim": req.claim,
-            "mediaGeneration": req.media_generation,
-            "region": req.region,
-            "startMs": req.start_ms,
-            "apiBase": req.api_base.trim_end_matches('/'),
-            "roomId": req.room_id,
-        }))?;
-        remux
-            .start(
-                ss_remux::RunInput::Youtube(ss_remux::youtube::Request { url: req.url }),
-                spec,
-            )
-            .await
+        self.make_room(&remux, &target.room_id).await;
+        remux.start(input, target.spec()?).await?;
+        self.started
+            .lock()
+            .push((target.run_id.clone(), target.room_id.clone()));
+        Ok(())
+    }
+
+    /// A machine hosts one room at a time in practice: with every slot
+    /// taken, the oldest run of another room (a tab closed mid-run, most
+    /// likely) gives its slot to the new one.
+    async fn make_room(&self, remux: &ss_remux::Remux, room: &str) {
+        use ss_remux::protocol::state;
+        let victim = {
+            let mut started = self.started.lock();
+            started.retain(|(run, _)| {
+                remux.status(run).is_some_and(|s| {
+                    !matches!(s.state, state::COMPLETED | state::CANCELLED | state::FAILED)
+                })
+            });
+            if started.len() < remux.slots() {
+                return;
+            }
+            started
+                .iter()
+                .find(|(_, r)| r != room)
+                .map(|(run, _)| run.clone())
+        };
+        if let Some(run) = victim {
+            tracing::info!(
+                run,
+                room,
+                "remux slots full; the oldest other room gives way"
+            );
+            remux.cancel(&run).await;
+        }
     }
 
     pub async fn run_status(&self, run_id: &str) -> Option<ss_remux::RunStatus> {

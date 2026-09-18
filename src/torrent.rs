@@ -26,7 +26,6 @@
 //!   HTTP status is derivable. Handlers should try
 //!   `err.downcast_ref::<TorrentError>()` first, then fall back to `500`.
 use std::{
-    collections::HashSet,
     io::SeekFrom,
     ops::Range,
     path::{Path, PathBuf},
@@ -36,10 +35,13 @@ use std::{
 };
 
 use anyhow::Context;
-use librqbit::{
-    api::TorrentIdOrHash, dht::Id20, AddTorrent, AddTorrentOptions, ListenerOptions,
-    ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
+use ss_remux::torrent::librqbit;
+use ss_remux::torrent::librqbit::{
+    api::TorrentIdOrHash, dht::Id20, AddTorrent, AddTorrentOptions, ConnectionOptions,
+    ListenerMode, ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
+    SessionPersistenceConfig,
 };
+use ss_remux::torrent::local::Local;
 /// 9.0.1 keeps the handle alias private (`torrent_state` is not public);
 /// spell it: every `Session` API that takes one accepts `&Arc<ManagedTorrent>`.
 type ManagedTorrentHandle = std::sync::Arc<ManagedTorrent>;
@@ -123,7 +125,9 @@ impl std::error::Error for TorrentError {}
 #[derive(Debug, Clone, Serialize)]
 pub struct TorrentFile {
     pub index: usize,
+    /// Relative to the torrent's root, `/`-separated, as the fleet lists it.
     pub path: String,
+    pub name: String,
     pub size: u64,
 }
 
@@ -210,6 +214,7 @@ pub fn progress_fraction(progress_bytes: u64, total_bytes: u64) -> f64 {
 #[derive(Clone)]
 pub struct TorrentManager {
     session: Arc<Session>,
+    local: Arc<Local>,
     dir: PathBuf,
 }
 
@@ -245,7 +250,17 @@ impl TorrentManager {
                 Self::session(&dir, &state_dir, Some(0)).await?
             }
         };
-        Ok(Self { session, dir })
+        let local = Local::new(session.clone());
+        Ok(Self {
+            session,
+            local,
+            dir,
+        })
+    }
+
+    /// The window and fill over this session, as the remux reads a file.
+    pub fn local(&self) -> Arc<Local> {
+        self.local.clone()
     }
 
     /// `dht_port: Some(0)` skips the persisted DHT port, which another process
@@ -262,8 +277,18 @@ impl TorrentManager {
                 ..Default::default()
             }),
             disable_trackers: false,
+            trackers: ss_remux::torrent::tracker_urls(),
             listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpAndUtp,
                 enable_upnp_port_forwarding: false,
+                ..Default::default()
+            }),
+            connect: Some(ConnectionOptions {
+                peer_opts: Some(PeerConnectionOptions {
+                    connect_timeout: Some(Duration::from_secs(4)),
+                    read_write_timeout: Some(Duration::from_secs(8)),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             fastresume: true,
@@ -296,14 +321,22 @@ impl TorrentManager {
         let id = handle.info_hash().as_string();
         let name = handle.name().unwrap_or_else(|| id.clone());
         let files = handle
-            .with_metadata(|m| {
-                m.info
-                    .iter_file_details()
+            .metadata
+            .load()
+            .as_ref()
+            .map(|m| {
+                m.file_infos
+                    .iter()
                     .enumerate()
-                    .map(|(index, d)| TorrentFile {
-                        index,
-                        path: d.filename.to_string(),
-                        size: d.len,
+                    .map(|(index, f)| {
+                        let path = f.relative_filename.to_string_lossy().replace('\\', "/");
+                        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                        TorrentFile {
+                            index,
+                            path,
+                            name,
+                            size: f.len,
+                        }
                     })
                     .collect::<Vec<_>>()
             })
@@ -332,8 +365,10 @@ impl TorrentManager {
             .session
             .add_torrent(
                 AddTorrent::from_url(magnet),
+                // Nothing comes down until a file is picked, as on the fleet.
                 Some(AddTorrentOptions {
                     overwrite: true,
+                    paused: true,
                     ..Default::default()
                 }),
             )
@@ -445,8 +480,8 @@ impl TorrentManager {
                 )));
             }
         }
-        self.session
-            .update_only_files(&handle, &HashSet::from([file_idx]))
+        self.local
+            .select(&handle.info_hash().as_string(), file_idx)
             .await
             .with_context(|| format!("error selecting file {file_idx} of torrent {id}"))
     }
@@ -628,6 +663,7 @@ mod tests {
             files: vec![TorrentFile {
                 index: 0,
                 path: "a/b".into(),
+                name: "b".into(),
                 size: 10,
             }],
         };
@@ -639,7 +675,7 @@ mod tests {
         }
         assert!(v.get("down_bps").is_none());
         let f = &v["files"][0];
-        for key in ["index", "path", "size"] {
+        for key in ["index", "path", "name", "size"] {
             assert!(f.get(key).is_some(), "missing file {key}");
         }
 

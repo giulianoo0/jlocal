@@ -17,6 +17,8 @@
 //! - `POST /youtube/resolve` -> { url } → { summary } or { error, detail }
 //! - `POST /youtube/run`   -> { url, runId, claim, roomId, mediaGeneration, region, startMs, apiBase } → { runId }
 //! - `GET /youtube/run/:id`, `DELETE /youtube/run/:id`
+//! - `POST /torrent/run`   -> { id, file, runId, claim, roomId, mediaGeneration, region, startMs, apiBase } → { runId }
+//! - `GET /torrent/run/:id`, `DELETE /torrent/run/:id`
 //!
 //! Security: Host must be loopback (DNS-rebinding guard); CORS only echoes
 //! allowlisted origins (`JLOCAL_ALLOWED_ORIGINS`); everything is `no-store`.
@@ -102,6 +104,8 @@ struct AudioCapabilities {
 #[derive(Serialize)]
 struct TorrentCapabilities {
     available: bool,
+    /// A picked file is remuxed here and published to the room (tools present).
+    remux: bool,
 }
 
 #[derive(Serialize)]
@@ -133,6 +137,11 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/torrent/select", post(torrent_select))
         .route("/torrent/stats/:id", get(torrent_stats))
         .route("/torrent/:id", delete(torrent_remove))
+        .route("/torrent/run", post(torrent_run))
+        .route(
+            "/torrent/run/:id",
+            get(youtube_run_status).delete(youtube_run_cancel),
+        )
         .route(
             "/youtube/tools",
             get(youtube_tools).post(youtube_tools_install),
@@ -170,6 +179,8 @@ pub fn router(state: AppState, port: u16) -> Router {
         .route("/torrent/select", axum::routing::options(preflight))
         .route("/torrent/stats/:id", axum::routing::options(preflight))
         .route("/torrent/:id", axum::routing::options(preflight))
+        .route("/torrent/run", axum::routing::options(preflight))
+        .route("/torrent/run/:id", axum::routing::options(preflight))
         .route("/youtube/tools", axum::routing::options(preflight))
         .route("/youtube/resolve", axum::routing::options(preflight))
         .route("/youtube/run", axum::routing::options(preflight))
@@ -281,6 +292,7 @@ async fn capabilities(State(s): State<ApiState>, headers: HeaderMap) -> impl Int
             },
             torrent: TorrentCapabilities {
                 available: s.state.caps.torrent,
+                remux: s.state.caps.torrent && s.state.youtube.ready(),
             },
             youtube: YoutubeCapabilities {
                 available: s.state.youtube.ready(),
@@ -1264,7 +1276,7 @@ async fn youtube_run(
             youtube_unavailable(&s.state.youtube.status())
         }
         Ok(Some(req)) => {
-            let run_id = req.run_id.clone();
+            let run_id = req.target.run_id.clone();
             match s.state.youtube.run(req).await {
                 Ok(()) => (
                     StatusCode::ACCEPTED,
@@ -1279,6 +1291,52 @@ async fn youtube_run(
                         StatusCode::BAD_GATEWAY
                     };
                     (status, Json(serde_json::json!({"error": code}))).into_response()
+                }
+            }
+        }
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn torrent_run(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let parsed = body
+        .map(|b| serde_json::from_value::<crate::youtube::TorrentRunRequest>(b.0))
+        .transpose();
+    let mut res = match (parsed, s.state.torrent.clone()) {
+        (Err(e), _) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request", "detail": e.to_string()})),
+        )
+            .into_response(),
+        (Ok(None), _) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request"})),
+        )
+            .into_response(),
+        (Ok(Some(_)), None) => torrent_unavailable().into_response(),
+        (Ok(Some(_)), Some(_)) if !s.state.youtube.ready() => {
+            youtube_unavailable(&s.state.youtube.status())
+        }
+        (Ok(Some(req)), Some(manager)) => {
+            let run_id = req.target.run_id.clone();
+            match s.state.youtube.run_torrent(&manager, req).await {
+                Ok(()) => (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({"runId": run_id})),
+                )
+                    .into_response(),
+                Err(e) => {
+                    let status = match e.downcast_ref::<crate::torrent::TorrentError>() {
+                        Some(_) => torrent_http_status(&e),
+                        None if e.to_string() == "remux_busy" => StatusCode::SERVICE_UNAVAILABLE,
+                        None => StatusCode::BAD_GATEWAY,
+                    };
+                    (status, Json(serde_json::json!({"error": e.to_string()}))).into_response()
                 }
             }
         }
