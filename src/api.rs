@@ -1823,6 +1823,74 @@ fn with_no_store(mut res: Response) -> Response {
     res
 }
 
+async fn youtube_live_start(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> impl IntoResponse {
+    let parsed = body
+        .map(|b| serde_json::from_value::<crate::youtube::LiveRequest>(b.0))
+        .transpose();
+    let mut res = match parsed {
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request", "detail": e.to_string()})),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_request"})),
+        )
+            .into_response(),
+        Ok(Some(req)) if !s.state.youtube.ready() => {
+            let _ = req;
+            youtube_unavailable(&s.state.youtube.status())
+        }
+        Ok(Some(req)) => match s.state.youtube.live_start(req).await {
+            Ok(()) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
+            Err(e) => {
+                let code = e.to_string();
+                let status = if code == "live_busy" {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                (status, Json(serde_json::json!({"error": code}))).into_response()
+            }
+        },
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_live_state(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+) -> impl IntoResponse {
+    let mut res = match s.state.youtube.live_state(&room).await {
+        Some(state) => Json(serde_json::json!(state)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "unknown_live"})),
+        )
+            .into_response(),
+    };
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
+async fn youtube_live_stop(
+    State(s): State<ApiState>,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+) -> impl IntoResponse {
+    let stopped = s.state.youtube.live_stop(&room).await;
+    let mut res = Json(serde_json::json!({"stopped": stopped})).into_response();
+    apply_cors(&s.state, &headers, res.headers_mut());
+    with_no_store(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2650,72 +2718,4 @@ mod tests {
         };
         assert_eq!(error, expected);
     }
-}
-
-async fn youtube_live_start(
-    State(s): State<ApiState>,
-    headers: HeaderMap,
-    body: Option<Json<serde_json::Value>>,
-) -> impl IntoResponse {
-    let parsed = body
-        .map(|b| serde_json::from_value::<crate::youtube::LiveRequest>(b.0))
-        .transpose();
-    let mut res = match parsed {
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "bad_request", "detail": e.to_string()})),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "bad_request"})),
-        )
-            .into_response(),
-        Ok(Some(req)) if !s.state.youtube.ready() => {
-            let _ = req;
-            youtube_unavailable(&s.state.youtube.status())
-        }
-        Ok(Some(req)) => match s.state.youtube.live_start(req).await {
-            Ok(()) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
-            Err(e) => {
-                let code = e.to_string();
-                let status = if code == "live_busy" {
-                    StatusCode::SERVICE_UNAVAILABLE
-                } else {
-                    StatusCode::BAD_GATEWAY
-                };
-                (status, Json(serde_json::json!({"error": code}))).into_response()
-            }
-        },
-    };
-    apply_cors(&s.state, &headers, res.headers_mut());
-    with_no_store(res)
-}
-
-async fn youtube_live_state(
-    State(s): State<ApiState>,
-    headers: HeaderMap,
-    Path(room): Path<String>,
-) -> impl IntoResponse {
-    let mut res = match s.state.youtube.live_state(&room).await {
-        Some(state) => Json(serde_json::json!(state)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "unknown_live"})),
-        )
-            .into_response(),
-    };
-    apply_cors(&s.state, &headers, res.headers_mut());
-    with_no_store(res)
-}
-
-async fn youtube_live_stop(
-    State(s): State<ApiState>,
-    headers: HeaderMap,
-    Path(room): Path<String>,
-) -> impl IntoResponse {
-    let stopped = s.state.youtube.live_stop(&room).await;
-    let mut res = Json(serde_json::json!({"stopped": stopped})).into_response();
-    apply_cors(&s.state, &headers, res.headers_mut());
-    with_no_store(res)
 }
