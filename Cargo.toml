@@ -1,6 +1,6 @@
 [package]
 name = "jlocal"
-version = "0.4.9"
+version = "0.4.10"
 edition = "2021"
 description = "jlocal — local companion for juntos.lol: local torrent + high-quality screenshare via MoQ relay"
 license = "MIT"
